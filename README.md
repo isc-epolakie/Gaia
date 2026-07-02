@@ -108,9 +108,6 @@ data tool.
 - **Serving the UI is IRIS too** — the built-in web server hosts both the REST-free static
   page and the results file; there is no separate web stack to stand up.
 
-The performance work (below) reaches a decompression-bound floor **without** leaving this
-IRIS-native shape.
-
 ---
 
 ## How it works
@@ -156,9 +153,6 @@ previous answer against a fixed reference. The 20-file run went from **~16.5 s t
    automatic fallbacks so the app still runs if the C kernel isn't built.)
 4. **Longest-processing-time-first scheduling.** Files vary 11–28 MB; queueing the biggest
    first stops a large file from becoming an end-of-run straggler.
-
-Beyond this the job is **decompression-bound and memory-bandwidth-limited** — the time to
-push ~1.5 GB of decompressed text through the fastest decoder — which is a hard floor.
 
 ### Robustness
 
@@ -211,16 +205,4 @@ compiled `ckernel` and the real data aren't present.)
 - **Embedded Python is a great fit for this data.** The quoted flux arrays are the awkward
   part; Python's `csv`/`float` handle them with almost no code for the reference path, and
   dropping to a C kernel for the hot loop was straightforward from there.
-- **`%SYSTEM.WorkMgr` is the right IRIS tool for the speedup** — worker jobs are separate
-  processes, so they sidestep the GIL and use every core. Two gotchas worth recording:
-  WorkMgr suppresses `Write` output from inside the coordination, and compiled code must be
-  rebuilt into the image to take effect (a stale compiled `^RunScript` silently runs the old
-  logic).
-- **Auto-loading** so `do ^RunScript` "just works" needed
-  `$System.OBJ.ImportDir(dir,"*.cls",…)` then `…,"*.mac",…` in `iris.script` — one
-  `ImportDir` wildcard handles only one file type.
-- **libdeflate without dev headers:** the image ships `libdeflate.so.0` but no header, so
-  the Cython kernel declares the few prototypes inline and links against the existing
-  shared object.
-- Columns are located by (fixed, header-verified) position, so a future column-order change
-  is detected rather than silently mis-parsed.
+- **Finding a creative way to display the data was lots of fun.**
