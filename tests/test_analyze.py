@@ -2,10 +2,13 @@
 
 Pure Python, no IRIS needed:  PYTHONPATH=src python -m pytest tests/ -v
 """
+import glob
 import gzip
 import os
 import csv
 import sys
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -13,6 +16,8 @@ from gaia.analyze import (  # noqa: E402
     parse_flux_array, band_stats, run, OUTPUT_HEADER,
     analyze_file, analyze_file_fast,
 )
+
+DATA_DIR = "/home/irisowner/dev/data/in"   # present only inside the container
 
 
 # ---- parse_flux_array ----
@@ -135,3 +140,25 @@ def test_run_band_with_no_valid_leaves_blanks(tmp_path):
     assert row[0] == "999"
     assert row[3] == "" and row[4] == ""      # rp blank
     assert abs(float(row[5]) - 900.0) < 1e-9
+
+
+# --- C-kernel parity (runs only inside the container, where ckernel + real data
+#     exist). Confirms the libdeflate C kernel matches the csv-based reference. ---
+
+def test_ckernel_matches_reference():
+    ck = pytest.importorskip("ckernel")
+    files = sorted(glob.glob(os.path.join(DATA_DIR, "EpochPhotometry_*.csv.gz")))
+    if not files:
+        pytest.skip("real DR3 data not present (run inside the container)")
+    BG, RG = 8, 13   # bp_flux / rp_flux array-group indices
+    for f in files[:3]:
+        ref = {r[0]: r for r in analyze_file(f) if r[5] > 100.0}
+        got = {r[0]: r for r in ck.analyze(f, BG, RG, 100.0)}
+        assert set(ref) == set(got)
+        for sid in ref:
+            for j in range(1, 6):
+                a, b = ref[sid][j], got[sid][j]
+                if a is None or b is None:
+                    assert a == b
+                else:
+                    assert abs(a - b) < 1e-9 * max(1, abs(a))

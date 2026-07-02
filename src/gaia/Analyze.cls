@@ -44,14 +44,14 @@ ClassMethod Run(inDir As %String, outPath As %String) As %Integer
   $$$ThrowOnError(q.WaitForComplete())
 
   // Merge the .part files into the final CSV in Python (fast bulk IO; the
-  // ObjectScript stream ReadLine loop was the bottleneck at this scale).
+  // ObjectScript stream ReadLine loop was the bottleneck at this scale). Use the
+  // tiny gaia.gmerge module so the coordinator doesn't import the heavy analyzer.
   Set sys = ##class(%SYS.Python).Import("sys")
   Do sys.path.append("/home/irisowner/dev/src")
   Set builtins = ##class(%SYS.Python).Import("builtins")
   Set plist = builtins.list()
   For i=1:1:files { Do plist.append(part(i)) }
-  Set analyze = ##class(%SYS.Python).Import("gaia.analyze")
-  Set total = analyze."merge_parts"(plist, outPath)
+  Set total = ##class(%SYS.Python).Import("gaia.gmerge")."merge_parts"(plist, outPath)
 
   // clean up the per-file parts
   For i=1:1:files { Do ##class(%File).Delete(part(i)) }

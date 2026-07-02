@@ -30,9 +30,12 @@ import gzip
 import math
 import os
 
-# isal.igzip decompresses gzip ~2x faster than the stdlib (decompression is the
-# single biggest cost here). Fall back to stdlib gzip if isal isn't installed so
-# the analyzer still runs anywhere (host tests, etc.).
+# Decompression is the single biggest cost (~2/3 of the run). isal.igzip streams
+# gzip ~2x faster than the stdlib. (We benchmarked libdeflate whole-buffer too:
+# faster at raw decompression in isolation, but once the lines are parsed the
+# advantage disappears, and under 20 parallel workers its whole-file buffering
+# adds memory pressure that makes it marginally slower. The real ceiling here is
+# memory bandwidth moving ~1.5 GB of decompressed text, not the codec.)
 try:
     from isal import igzip as _gz
 except ImportError:  # pragma: no cover
@@ -202,9 +205,9 @@ def analyze_file_fast(path):
     """Fast per-file analyzer: yields (source_id, bp_min, bp_max, rp_min, rp_max,
     pct) for every scored source. Identical results to analyze_file.
 
-    Works entirely in BYTES (no str decode): gzip -> bytes lines -> bytes regex
-    for the two array cells we need -> C-level min/max. This keeps the parse cost
-    behind the (dominant) decompression cost."""
+    Works entirely in BYTES (no str decode): isal streams gzip -> bytes lines ->
+    bytes regex for the two array cells we need -> C-level min/max. Streaming keeps
+    per-line memory tiny, which matters under 20 parallel workers."""
     with _gz.open(path, "rb") as f:
         header_line = None
         for line in f:
@@ -245,17 +248,36 @@ def analyze_file_fast(path):
             yield sid.decode(), bmn, bmx, rmn, rmx, pct
 
 
+# The C kernel (ckernel.pyx: libdeflate decompress + scan + write, all in C) is
+# the fastest worker path — the decompressed bytes never become Python objects.
+# Built at image time into user site-packages; falls back to the Python fast path
+# (analyze_file_fast) if it isn't available.
+try:
+    import ckernel as _ckernel
+except ImportError:  # pragma: no cover
+    _ckernel = None
+
+# bp_flux / rp_flux "[...]"-group indices within a row. Columns 0..2 are scalar,
+# arrays start at column 3, and the DR3 layout is fixed: bp_flux=col 11, rp_flux=col 16.
+_BP_GROUP = 11 - 3
+_RP_GROUP = 16 - 3
+
+
 def write_part(path, out_path):
     """Worker unit: analyze one file, write qualifying (>100%) rows to out_path
-    (no header). Returns (seen, qualified). Called by IRIS WorkMgr workers."""
-    seen = q = 0
+    (no header). Returns the qualifying count. Called by IRIS WorkMgr workers.
+
+    Uses the C kernel when available (writes the CSV rows itself, in C); otherwise
+    the pure-Python/Cython fast path."""
+    if _ckernel is not None:
+        return _ckernel.analyze_to_file(path, _BP_GROUP, _RP_GROUP, 100.0, out_path)
+    q = 0
     with open(out_path, "w", newline="") as f:
         for sid, bmn, bmx, rmn, rmx, pct in analyze_file_fast(path):
-            seen += 1
             if pct > 100.0:
                 q += 1
                 f.write("%s,%s,%s,%s,%s,%r\n" % (sid, _fmt(bmn), _fmt(bmx), _fmt(rmn), _fmt(rmx), pct))
-    return seen, q
+    return q
 
 
 def merge_parts(part_paths, out_path):

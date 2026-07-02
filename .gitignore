@@ -36,3 +36,4 @@ data/temp/
 src/gaia/fastmm.c
 src/gaia/*.so
 src/gaia/build/
+src/gaia/ckernel.c
