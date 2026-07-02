@@ -67,15 +67,24 @@ The files are **ECSV** (≈365 leading `#` comment lines, then a CSV header, the
 `bp_flux`/`rp_flux` are **quoted arrays** like `"[NaN,50.0,…,157841.99]"` — the commas live
 inside the quotes. `gzip` streams each file a row at a time (flat memory, no extraction step).
 
-**Performance.** Two optimizations take the 20-file run from ~16.5 s to **~3 s**:
-1. *Parallelism.* The 20 files are independent, so `%SYSTEM.WorkMgr` processes them
+**Performance.** Profiling drove the 20-file run from ~16.5 s to **~2 s** (≈8×). In order
+of impact:
+1. *Parallelism (`%SYSTEM.WorkMgr`).* The 20 files are independent, so they are processed
    concurrently across worker jobs — the idiomatic IRIS way to scale, and each worker has
    its own Python interpreter so there is no GIL bottleneck.
-2. *Fast parse.* A row is 48 columns of mostly huge quoted arrays; `csv.reader` alone cost
+2. *Faster decompression (`isal`).* Decompression is ~⅔ of the work; `isal.igzip`
+   decompresses gzip ~2× faster than the stdlib. The analyzer falls back to stdlib `gzip`
+   if `isal` is absent, so it still runs anywhere.
+3. *Fast parse.* A row is 48 columns of mostly huge quoted arrays; `csv.reader` alone cost
    ~6.8 s parsing all of it. We instead pull only the three fields we need — `source_id`
-   and the `bp_flux`/`rp_flux` array groups (columns are still resolved from the header, so
-   a layout change is detected, not mis-parsed). The readable `csv`-based `analyze_file` is
-   kept as a reference and a test asserts the fast path matches it exactly.
+   and the `bp_flux`/`rp_flux` array groups — walking the arrays with a regex and stopping
+   once both are found (the ~31 trailing array columns are never scanned). Columns are
+   still resolved from the header, so a layout change is detected, not mis-parsed. The
+   readable `csv`-based `analyze_file` is kept as a reference and a test asserts the fast
+   path matches it exactly.
+4. *Longest-processing-time-first scheduling.* Files vary 11–28 MB; queueing the biggest
+   first keeps a large file from becoming an end-of-run straggler (~2.1 s → ~1.5 s of
+   compute). Beyond this the work is memory-bandwidth-bound and plateaus at ~4–5× scaling.
 
 ## Run it
 
@@ -130,9 +139,9 @@ PYTHONPATH=src python -m pytest tests/ -v
   wildcard silently loaded nothing.
 - **`%SYSTEM.WorkMgr` was the right tool for the speedup.** The 20 files are independent,
   so fanning them across worker jobs (separate processes, each with its own embedded
-  Python) sidesteps the GIL and scales across cores — dropping the run from ~16.5 s to
-  ~3 s. Worth knowing: WorkMgr suppresses `Write` output from inside the coordination, and
-  the win only appears once the classes are actually recompiled into the image (a stale
-  compiled `^RunScript` will keep running the old code — rebuild after changes).
+  Python) sidesteps the GIL and scales across cores. Worth knowing: WorkMgr suppresses
+  `Write` output from inside the coordination, and the win only appears once the classes
+  are actually recompiled into the image (a stale compiled `^RunScript` will keep running
+  the old code — rebuild after changes).
 - Columns are located by name, never by index, so a future column-order change can't
   silently corrupt the result.

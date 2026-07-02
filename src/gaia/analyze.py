@@ -30,6 +30,14 @@ import gzip
 import math
 import os
 
+# isal.igzip decompresses gzip ~2x faster than the stdlib (decompression is the
+# single biggest cost here). Fall back to stdlib gzip if isal isn't installed so
+# the analyzer still runs anywhere (host tests, etc.).
+try:
+    from isal import igzip as _gz
+except ImportError:  # pragma: no cover
+    _gz = gzip
+
 # The three columns we need, located by name from the header (never by index, so a
 # column-order change in a future release can't silently corrupt results).
 COL_SOURCE_ID = "source_id"
@@ -85,7 +93,7 @@ def band_stats(values):
 
 def _rows(path):
     """Yield csv rows from a (gzipped) ECSV file, skipping '#' comment lines."""
-    with gzip.open(path, "rt", newline="") as f:
+    with _gz.open(path, "rt", newline="") as f:
         data_lines = (line for line in f if not line.startswith("#"))
         yield from csv.reader(data_lines)
 
@@ -115,11 +123,12 @@ def analyze_file(path):
 
 # --- Fast path -------------------------------------------------------------
 # csv.reader spends ~6.8s parsing all 48 columns' quoting when we need only 3.
-# The row layout is fixed: the first 11 fields are scalar (no commas), then every
+# The row layout is fixed: the first 3 fields are scalar (no commas), then every
 # remaining field is a quoted "[...]" array. So source_id is the 2nd scalar, and
-# bp_flux / rp_flux are specific "[...]" groups. We find the array groups with a
-# regex and index the two we need. Column positions are still resolved from the
-# header (not hard-coded) so a layout change is detected, not silently mis-parsed.
+# bp_flux / rp_flux are specific "[...]" groups. We walk the array groups with a
+# regex and STOP once we've seen the rp group (the ~31 trailing arrays are never
+# parsed). Column positions are still resolved from the header (not hard-coded),
+# so a layout change is detected, not silently mis-parsed.
 import re  # noqa: E402
 _ARR = re.compile(r"\[[^\]]*\]")
 
@@ -163,7 +172,7 @@ def _header_array_indices(header_line):
 def analyze_file_fast(path):
     """Fast per-file analyzer: yields (source_id, bp_min, bp_max, rp_min, rp_max,
     pct) for every scored source. Identical results to analyze_file."""
-    with gzip.open(path, "rt", newline="") as f:
+    with _gz.open(path, "rt", newline="") as f:
         header_line = None
         for line in f:
             if line[0] == "#":
@@ -171,18 +180,29 @@ def analyze_file_fast(path):
             header_line = line
             break
         sidx, bg, rg = _header_array_indices(header_line)
-        need = max(bg, rg)
+        lo, hi = (bg, rg) if bg < rg else (rg, bg)
         for line in f:
             if line[0] == "#":
                 continue
             # source_id: leading scalars are comma-separated and have no commas,
             # so a bounded split of the pre-'[' prefix is safe and cheap.
             sid = line.split(",", sidx + 1)[sidx]
-            grps = _ARR.findall(line)
-            if len(grps) <= need:
+            # Walk the "[...]" groups, grab the bp and rp ones, stop at the later
+            # of the two (the trailing ~31 array columns are never scanned).
+            bp_cell = rp_cell = None
+            i = 0
+            for m in _ARR.finditer(line):
+                if i == bg:
+                    bp_cell = m.group()
+                if i == rg:
+                    rp_cell = m.group()
+                if i == hi:
+                    break
+                i += 1
+            if rp_cell is None and bp_cell is None:
                 continue
-            bmn, bmx = _minmax_valid(grps[bg])
-            rmn, rmx = _minmax_valid(grps[rg])
+            bmn, bmx = _minmax_valid(bp_cell) if bp_cell is not None else (None, None)
+            rmn, rmx = _minmax_valid(rp_cell) if rp_cell is not None else (None, None)
             bp_pct = ((bmx - bmn) / bmn) * 100.0 if bmn is not None else None
             rp_pct = ((rmx - rmn) / rmn) * 100.0 if rmn is not None else None
             if bp_pct is None and rp_pct is None:
