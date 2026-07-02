@@ -67,7 +67,7 @@ The files are **ECSV** (≈365 leading `#` comment lines, then a CSV header, the
 `bp_flux`/`rp_flux` are **quoted arrays** like `"[NaN,50.0,…,157841.99]"` — the commas live
 inside the quotes. `gzip` streams each file a row at a time (flat memory, no extraction step).
 
-**Performance.** Profiling drove the 20-file run from ~16.5 s to **~2 s** (≈8×). In order
+**Performance.** Profiling drove the 20-file run from ~16.5 s to **~1.6 s** (≈10×). In order
 of impact:
 1. *Parallelism (`%SYSTEM.WorkMgr`).* The 20 files are independent, so they are processed
    concurrently across worker jobs — the idiomatic IRIS way to scale, and each worker has
@@ -81,10 +81,15 @@ of impact:
    once both are found (the ~31 trailing array columns are never scanned). Columns are
    still resolved from the header, so a layout change is detected, not mis-parsed. The
    readable `csv`-based `analyze_file` is kept as a reference and a test asserts the fast
-   path matches it exactly.
-4. *Longest-processing-time-first scheduling.* Files vary 11–28 MB; queueing the biggest
-   first keeps a large file from becoming an end-of-run straggler (~2.1 s → ~1.5 s of
-   compute). Beyond this the work is memory-bandwidth-bound and plateaus at ~4–5× scaling.
+   path matches it exactly. The fast path works entirely in **bytes** (no str decode).
+4. *C-level min/max (Cython).* The per-token `float()` + min/max loop was the biggest
+   remaining Python cost (~1.4 s); `src/gaia/fastmm.pyx` scans the raw bytes with `strtod`
+   ~3× faster, which hides the parse behind decompression. Compiled at image build into
+   user site-packages (see `scripts/build_fastmm.sh`); the analyzer falls back to pure
+   Python if it isn't built, so it runs anywhere.
+5. *Longest-processing-time-first scheduling.* Files vary 11–28 MB; queueing the biggest
+   first keeps a large file from becoming an end-of-run straggler. Beyond this the work is
+   memory-bandwidth-bound (decompression is ~⅔ of it) and parallel scaling plateaus.
 
 ## Run it
 
@@ -118,6 +123,8 @@ PYTHONPATH=src python -m pytest tests/ -v
 | `src/Gaia/Analyze.cls` | parallel coordinator: fan the files across WorkMgr, merge results |
 | `src/Gaia/Work.cls` | one WorkMgr unit: analyze a single file via embedded Python |
 | `src/gaia/analyze.py` | embedded-Python analyzer (parse → per-band min/max/% → filter → CSV) |
+| `src/gaia/fastmm.pyx` | Cython C-level min/max over a flux cell (compiled at build; optional) |
+| `scripts/build_fastmm.sh` | compiles fastmm into user site-packages during the image build |
 | `tests/test_analyze.py` | host unit tests: parsing, math, and fast/reference parity |
 | `iris.script` | build-time setup; pre-compiles `src/*.cls` + `src/*.mac` into USER |
 | `data/in/` | the 20 benchmark `.csv.gz` files (from the template) |

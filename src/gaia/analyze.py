@@ -130,11 +130,40 @@ def analyze_file(path):
 # parsed). Column positions are still resolved from the header (not hard-coded),
 # so a layout change is detected, not silently mis-parsed.
 import re  # noqa: E402
-_ARR = re.compile(r"\[[^\]]*\]")
+_ARR = re.compile(r"\[[^\]]*\]")           # str form (reference / fallback)
+_ARRB = re.compile(rb"\[[^\]]*\]")         # bytes form (production fast path)
+
+# C-level min/max over a flux cell (bytes). ~3x faster than the Python loop and,
+# on bytes input, makes the parse cost effectively free behind gzip decompression.
+# The compiled module lives in user site-packages as top-level `fastmm` (the
+# docker mount shadows a copy inside src/gaia); `gaia.fastmm` is the fallback for
+# a locally-built host copy; pure Python is the final fallback.
+try:
+    try:
+        from fastmm import minmax as _minmax_bytes
+    except ImportError:
+        from gaia.fastmm import minmax as _minmax_bytes
+except ImportError:  # pragma: no cover
+    def _minmax_bytes(cell):           # cell: bytes WITHOUT brackets
+        mn = mx = None
+        for tok in cell.split(b","):
+            if not tok or tok[0] in (78, 110):   # 'N' / 'n'
+                continue
+            try:
+                v = float(tok)
+            except ValueError:
+                continue
+            if 0.0 < v < 1.7976931348623157e308:
+                if mn is None or v < mn:
+                    mn = v
+                if mx is None or v > mx:
+                    mx = v
+        return mn, mx
 
 
 def _minmax_valid(cell):
-    """min/max of finite, >0 values in a '[...]' cell, or (None, None)."""
+    """min/max of finite, >0 values in a bracketed '[...]' str cell (reference
+    path used by analyze_file and its parity test)."""
     mn = mx = None
     for tok in cell[1:-1].split(","):
         if not tok:
@@ -171,27 +200,31 @@ def _header_array_indices(header_line):
 
 def analyze_file_fast(path):
     """Fast per-file analyzer: yields (source_id, bp_min, bp_max, rp_min, rp_max,
-    pct) for every scored source. Identical results to analyze_file."""
-    with _gz.open(path, "rt", newline="") as f:
+    pct) for every scored source. Identical results to analyze_file.
+
+    Works entirely in BYTES (no str decode): gzip -> bytes lines -> bytes regex
+    for the two array cells we need -> C-level min/max. This keeps the parse cost
+    behind the (dominant) decompression cost."""
+    with _gz.open(path, "rb") as f:
         header_line = None
         for line in f:
-            if line[0] == "#":
+            if line[:1] == b"#":
                 continue
             header_line = line
             break
-        sidx, bg, rg = _header_array_indices(header_line)
-        lo, hi = (bg, rg) if bg < rg else (rg, bg)
+        sidx, bg, rg = _header_array_indices(header_line.decode())
+        hi = bg if bg > rg else rg
         for line in f:
-            if line[0] == "#":
+            if line[:1] == b"#":
                 continue
             # source_id: leading scalars are comma-separated and have no commas,
             # so a bounded split of the pre-'[' prefix is safe and cheap.
-            sid = line.split(",", sidx + 1)[sidx]
+            sid = line.split(b",", sidx + 1)[sidx]
             # Walk the "[...]" groups, grab the bp and rp ones, stop at the later
             # of the two (the trailing ~31 array columns are never scanned).
             bp_cell = rp_cell = None
             i = 0
-            for m in _ARR.finditer(line):
+            for m in _ARRB.finditer(line):
                 if i == bg:
                     bp_cell = m.group()
                 if i == rg:
@@ -201,14 +234,15 @@ def analyze_file_fast(path):
                 i += 1
             if rp_cell is None and bp_cell is None:
                 continue
-            bmn, bmx = _minmax_valid(bp_cell) if bp_cell is not None else (None, None)
-            rmn, rmx = _minmax_valid(rp_cell) if rp_cell is not None else (None, None)
+            bmn, bmx = _minmax_bytes(bp_cell[1:-1]) if bp_cell is not None else (None, None)
+            rmn, rmx = _minmax_bytes(rp_cell[1:-1]) if rp_cell is not None else (None, None)
             bp_pct = ((bmx - bmn) / bmn) * 100.0 if bmn is not None else None
             rp_pct = ((rmx - rmn) / rmn) * 100.0 if rmn is not None else None
             if bp_pct is None and rp_pct is None:
                 continue
             pct = bp_pct if rp_pct is None else rp_pct if bp_pct is None else (bp_pct if bp_pct >= rp_pct else rp_pct)
-            yield sid, bmn, bmx, rmn, rmx, pct
+            # sid is bytes here; decode just this one small field for the CSV
+            yield sid.decode(), bmn, bmx, rmn, rmx, pct
 
 
 def write_part(path, out_path):
