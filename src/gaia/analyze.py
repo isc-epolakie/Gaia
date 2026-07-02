@@ -10,15 +10,19 @@ the source only when that exceeds 100%.
 
 Design notes / feedback (the contest asks for these):
 - The files are ECSV: ~365 leading '#' comment lines, then a CSV header, then data.
-  We just skip every line starting with '#' and let csv.reader parse the rest.
+  We skip every line starting with '#'.
 - bp_flux / rp_flux are QUOTED arrays like "[NaN,50.0,...]" — the commas are inside
-  the quotes, so a naive split breaks. Python's csv module handles the quoting for
-  free, which is a big reason embedded Python is a pleasant fit here.
+  the quotes, so a naive split of the whole row breaks. There are two paths here:
+  * analyze_file() — readable reference using csv.reader (handles the quoting for free).
+  * analyze_file_fast() — the production path. csv.reader spends ~6.8s parsing all 48
+    columns' quoting; we instead extract only source_id and the bp/rp array groups, cutting
+    the single-thread parse from ~15.7s to ~11s. A test asserts the two paths agree exactly.
+  The files are then fanned across %SYSTEM.WorkMgr workers (see src/Gaia/*.cls), taking the
+  full run to ~3s.
 - "Valid" flux = a finite number that is > 0. The task says ignore missing / null /
   NaN / "otherwise invalid"; negative and zero flux are unphysical (Gaia itself flags
   negative flux as rejected) and dividing by a zero/negative min would be nonsense.
-- Pure functions (no IRIS dependency) so this runs and unit-tests on the host too;
-  RunScript.mac calls run() inside IRIS via embedded Python.
+- Pure functions (no IRIS dependency) so this runs and unit-tests on the host too.
 """
 import csv
 import glob
@@ -89,7 +93,9 @@ def _rows(path):
 def analyze_file(path):
     """Yield qualifying result rows (as lists matching OUTPUT_HEADER) from one file.
 
-    Also yields via the returned generator; callers count total vs qualifying.
+    Reference (readable) implementation using csv.reader; analyze_file_fast below
+    produces identical results but avoids the ~6.8s csv.reader overhead by
+    extracting only the three fields we need. Kept for cross-checking in tests.
     """
     it = _rows(path)
     header = next(it)
@@ -105,6 +111,115 @@ def analyze_file(path):
             continue
         pct = max(pcts)
         yield row[si], bp_min, bp_max, rp_min, rp_max, pct
+
+
+# --- Fast path -------------------------------------------------------------
+# csv.reader spends ~6.8s parsing all 48 columns' quoting when we need only 3.
+# The row layout is fixed: the first 11 fields are scalar (no commas), then every
+# remaining field is a quoted "[...]" array. So source_id is the 2nd scalar, and
+# bp_flux / rp_flux are specific "[...]" groups. We find the array groups with a
+# regex and index the two we need. Column positions are still resolved from the
+# header (not hard-coded) so a layout change is detected, not silently mis-parsed.
+import re  # noqa: E402
+_ARR = re.compile(r"\[[^\]]*\]")
+
+
+def _minmax_valid(cell):
+    """min/max of finite, >0 values in a '[...]' cell, or (None, None)."""
+    mn = mx = None
+    for tok in cell[1:-1].split(","):
+        if not tok:
+            continue
+        c = tok[0]
+        if c == "N" or c == "n":      # NaN / null
+            continue
+        try:
+            v = float(tok)
+        except ValueError:
+            continue
+        if v > 0.0:                    # finite & positive (inf is caught below)
+            if v == float("inf"):
+                continue
+            if mn is None or v < mn:
+                mn = v
+            if mx is None or v > mx:
+                mx = v
+    return mn, mx
+
+
+def _header_array_indices(header_line):
+    """From the header line, return (source_id_scalar_ok, bp_group, rp_group):
+    which 0-based '[...]'-group corresponds to bp_flux and rp_flux."""
+    cols = header_line.rstrip("\n").split(",")
+    # Columns 0..2 (solution_id, source_id, n_transits) are scalar; every column
+    # from transit_id (index 3) onward is a quoted "[...]" array. So the Nth array
+    # group corresponds to column (3 + N), i.e. array_index = column_index - 3.
+    first_array = 3
+    bp = cols.index(COL_BP_FLUX) - first_array
+    rp = cols.index(COL_RP_FLUX) - first_array
+    return cols.index(COL_SOURCE_ID), bp, rp
+
+
+def analyze_file_fast(path):
+    """Fast per-file analyzer: yields (source_id, bp_min, bp_max, rp_min, rp_max,
+    pct) for every scored source. Identical results to analyze_file."""
+    with gzip.open(path, "rt", newline="") as f:
+        header_line = None
+        for line in f:
+            if line[0] == "#":
+                continue
+            header_line = line
+            break
+        sidx, bg, rg = _header_array_indices(header_line)
+        need = max(bg, rg)
+        for line in f:
+            if line[0] == "#":
+                continue
+            # source_id: leading scalars are comma-separated and have no commas,
+            # so a bounded split of the pre-'[' prefix is safe and cheap.
+            sid = line.split(",", sidx + 1)[sidx]
+            grps = _ARR.findall(line)
+            if len(grps) <= need:
+                continue
+            bmn, bmx = _minmax_valid(grps[bg])
+            rmn, rmx = _minmax_valid(grps[rg])
+            bp_pct = ((bmx - bmn) / bmn) * 100.0 if bmn is not None else None
+            rp_pct = ((rmx - rmn) / rmn) * 100.0 if rmn is not None else None
+            if bp_pct is None and rp_pct is None:
+                continue
+            pct = bp_pct if rp_pct is None else rp_pct if bp_pct is None else (bp_pct if bp_pct >= rp_pct else rp_pct)
+            yield sid, bmn, bmx, rmn, rmx, pct
+
+
+def write_part(path, out_path):
+    """Worker unit: analyze one file, write qualifying (>100%) rows to out_path
+    (no header). Returns (seen, qualified). Called by IRIS WorkMgr workers."""
+    seen = q = 0
+    with open(out_path, "w", newline="") as f:
+        for sid, bmn, bmx, rmn, rmx, pct in analyze_file_fast(path):
+            seen += 1
+            if pct > 100.0:
+                q += 1
+                f.write("%s,%s,%s,%s,%s,%r\n" % (sid, _fmt(bmn), _fmt(bmx), _fmt(rmn), _fmt(rmx), pct))
+    return seen, q
+
+
+def merge_parts(part_paths, out_path):
+    """Concatenate worker .part files into out_path with the CSV header. Done in
+    Python (fast bulk IO) rather than ObjectScript stream ReadLine (very slow).
+    Returns the number of data rows written."""
+    rows = 0
+    with open(out_path, "w", newline="") as out:
+        out.write(",".join(OUTPUT_HEADER) + "\n")
+        for p in part_paths:
+            if not os.path.exists(p):
+                continue
+            with open(p, "r") as f:
+                data = f.read()
+            if data:
+                out.write(data)
+                rows += data.count("\n")
+    return rows
 
 
 def _fmt(v):

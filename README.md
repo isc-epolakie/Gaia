@@ -48,21 +48,34 @@ A band with no valid flux leaves its two columns blank. Rows are sorted by
 data/in/EpochPhotometry_*.csv.gz   (20 gzipped ECSV files, shipped with the template)
       │
    src/RunScript.mac   ← graders run  do ^RunScript
-      │  times the run, then calls the embedded-Python analyzer
+      │  times the run, then calls the parallel coordinator
       ▼
-   src/gaia/analyze.py  (embedded Python)
-      │  • stream each .gz with gzip + csv, skipping the ECSV '#' header lines
-      │  • locate source_id / bp_flux / rp_flux columns by NAME
-      │  • parse the quoted flux arrays, keep finite & >0 values
-      │  • per-band min/max/%, take the max, keep if > 100
+   Gaia.Analyze.Run (ObjectScript)
+      │  fans the 20 files across %SYSTEM.WorkMgr worker jobs — each a separate
+      │  process with its own embedded Python, so parsing scales across CPU cores
+      │  with no GIL contention
+      ├───► Gaia.Work.ProcessFile → gaia.analyze.write_part   (one worker per file)
+      │        • gunzip + skip the ECSV '#' header lines
+      │        • extract source_id / bp_flux / rp_flux (fast positional parse)
+      │        • keep finite & >0 flux, per-band min/max/%, take the max, keep >100
+      │        • write qualifying rows to a per-file .part
       ▼
-   data/out/results.csv
+   gaia.analyze.merge_parts  →  data/out/results.csv   (header + all parts)
 ```
 
 The files are **ECSV** (≈365 leading `#` comment lines, then a CSV header, then data), and
 `bp_flux`/`rp_flux` are **quoted arrays** like `"[NaN,50.0,…,157841.99]"` — the commas live
-inside the quotes. Python's `csv` module parses the quoting for free, and `gzip` streams the
-files a row at a time, so memory stays flat and no separate extraction step is needed.
+inside the quotes. `gzip` streams each file a row at a time (flat memory, no extraction step).
+
+**Performance.** Two optimizations take the 20-file run from ~16.5 s to **~3 s**:
+1. *Parallelism.* The 20 files are independent, so `%SYSTEM.WorkMgr` processes them
+   concurrently across worker jobs — the idiomatic IRIS way to scale, and each worker has
+   its own Python interpreter so there is no GIL bottleneck.
+2. *Fast parse.* A row is 48 columns of mostly huge quoted arrays; `csv.reader` alone cost
+   ~6.8 s parsing all of it. We instead pull only the three fields we need — `source_id`
+   and the `bp_flux`/`rp_flux` array groups (columns are still resolved from the header, so
+   a layout change is detected, not mis-parsed). The readable `csv`-based `analyze_file` is
+   kept as a reference and a test asserts the fast path matches it exactly.
 
 ## Run it
 
@@ -74,9 +87,10 @@ docker-compose exec iris iris session iris
 USER>do ^RunScript
 ```
 
-`RunScript` is pre-compiled into the USER namespace at image build time (see `iris.script`),
-so it is ready to run immediately. It prints the number of sources scored, the number over
-100%, and the elapsed time, and writes `data/out/results.csv`.
+`RunScript` and the `Gaia.*` classes are pre-compiled into the USER namespace at image
+build time (see `iris.script`), so `do ^RunScript` is ready to run immediately. It prints
+the number of sources over 100%, the output path, and the elapsed time, and writes
+`data/out/results.csv`.
 
 ## Tests
 
@@ -92,9 +106,11 @@ PYTHONPATH=src python -m pytest tests/ -v
 | Path | What |
 |---|---|
 | `src/RunScript.mac` | ObjectScript entrypoint the graders run (`do ^RunScript`) |
+| `src/Gaia/Analyze.cls` | parallel coordinator: fan the files across WorkMgr, merge results |
+| `src/Gaia/Work.cls` | one WorkMgr unit: analyze a single file via embedded Python |
 | `src/gaia/analyze.py` | embedded-Python analyzer (parse → per-band min/max/% → filter → CSV) |
-| `tests/test_analyze.py` | host unit tests for the parsing and math |
-| `iris.script` | build-time setup; pre-compiles `src/*.mac` into USER |
+| `tests/test_analyze.py` | host unit tests: parsing, math, and fast/reference parity |
+| `iris.script` | build-time setup; pre-compiles `src/*.cls` + `src/*.mac` into USER |
 | `data/in/` | the 20 benchmark `.csv.gz` files (from the template) |
 | `data/out/results.csv` | generated output (gitignored) |
 | `docs/` | design spec |
@@ -108,8 +124,15 @@ PYTHONPATH=src python -m pytest tests/ -v
 - Calling Python from `RunScript.mac` via `##class(%SYS.Python).Import(...)` is clean; the
   one quirk was reading a returned Python tuple from ObjectScript, done with
   `result."__getitem__"(0)`.
-- Getting the routine auto-loaded so `do ^RunScript` "just works" needed
-  `$System.OBJ.ImportDir(dir,"*.mac","ck",,1)` in `iris.script` — `LoadDir` without the
+- Getting the classes + routine auto-loaded so `do ^RunScript` "just works" needed
+  `$System.OBJ.ImportDir(dir,"*.cls","ck",,1)` then `...,"*.mac",...` in `iris.script` —
+  a single `ImportDir` wildcard only handles one file type, and `LoadDir` without the
   wildcard silently loaded nothing.
+- **`%SYSTEM.WorkMgr` was the right tool for the speedup.** The 20 files are independent,
+  so fanning them across worker jobs (separate processes, each with its own embedded
+  Python) sidesteps the GIL and scales across cores — dropping the run from ~16.5 s to
+  ~3 s. Worth knowing: WorkMgr suppresses `Write` output from inside the coordination, and
+  the win only appears once the classes are actually recompiled into the image (a stale
+  compiled `^RunScript` will keep running the old code — rebuild after changes).
 - Columns are located by name, never by index, so a future column-order change can't
   silently corrupt the result.

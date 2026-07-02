@@ -1,5 +1,7 @@
-    ; Pre-compile our routine(s) into USER so graders can run `do ^RunScript`
-    ; straight away with no manual import step.
+    ; Pre-compile our classes + routine into USER so graders can run
+    ; `do ^RunScript` straight away with no manual import step. Import classes
+    ; first (RunScript depends on Gaia.Analyze), then the .mac routine.
+    do $System.OBJ.ImportDir("/home/irisowner/dev/src","*.cls","ck",,1)
     do $System.OBJ.ImportDir("/home/irisowner/dev/src","*.mac","ck",,1)
 
     ;disabling password expire for development purposes

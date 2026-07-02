@@ -10,21 +10,18 @@ Run()
  #; Start time
  Set startTime = $ZHOROLOG
 
- #; Make the embedded-Python analyzer importable, then run it. The analyzer
- #; streams the 20 gzipped ECSV files, keeps valid (finite, >0) BP/RP flux,
- #; computes per-band ((max-min)/min)*100, takes the larger of the two, and
- #; writes data/out/results.csv (with header) for sources above 100%.
- Set sys = ##class(%SYS.Python).Import("sys")
- Do sys.path.append(base_"/src")
- Set analyze = ##class(%SYS.Python).Import("gaia.analyze")
- Set result = analyze.run(inDir, outPath)   ; returns (seen, qualified)
+ #; Fan the 20 files across %SYSTEM.WorkMgr worker jobs (each its own process +
+ #; embedded Python, so flux-array parsing scales across cores with no GIL
+ #; contention), then merge the per-file results into data/out/results.csv with
+ #; the required header. Each worker keeps valid (finite, >0) BP/RP flux, computes
+ #; per-band ((max-min)/min)*100, takes the larger of the two, emits rows > 100%.
+ Set qualified = ##class(Gaia.Analyze).Run(inDir, outPath)
 
  #; End time
  Set endTime = $ZHOROLOG
  Set elapsed = endTime - startTime
 
- Write "Sources scored:    ", result."__getitem__"(0), !
- Write "Sources over 100%: ", result."__getitem__"(1), !
+ Write "Sources over 100%: ", qualified, !
  Write "Output written to: ", outPath, !
  Write "Elapsed time: ", elapsed, " seconds", !
 }

@@ -28,3 +28,6 @@ data/temp/EpochPhotometry_020985-021233.csv
 
 # IRIS runtime log (regenerated)
 iris-main.log
+
+# worker scratch + extracted CSVs
+data/temp/
