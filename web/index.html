@@ -129,9 +129,9 @@
     <div id="databar">
       <button id="backup" onclick="backToSky()">Back to the sky</button>
       <div id="dbfilter">
-        <label for="minpct">Min % change</label>
-        <input id="minpct" type="number" value="100" min="0" step="50">
-        <button class="backup" style="border:1px solid var(--line);background:rgba(122,162,255,.08);color:var(--accent);border-radius:8px;padding:8px 16px;font-size:12px;font-weight:600;font-family:inherit;cursor:pointer" onclick="applyFilter()">Filter</button>
+        <label for="minpct2">Min % change</label>
+        <input id="minpct2" type="number" value="100" min="0" step="50">
+        <button class="backup" style="border:1px solid var(--line);background:rgba(122,162,255,.08);color:var(--accent);border-radius:8px;padding:8px 16px;font-size:12px;font-weight:600;font-family:inherit;cursor:pointer" onclick="applyFilter(true)">Filter</button>
       </div>
     </div>
     <div id="panel">
@@ -143,7 +143,15 @@
 </main>
 
 <div id="controls">
-  <div id="dock"><span class="stat" id="stat">loading DR3 results...</span></div>
+  <div id="dock">
+    <span class="stat" id="stat">loading DR3 results...</span>
+    <span style="width:1px;height:22px;background:var(--line)"></span>
+    <label for="minpct" style="font-size:11px;letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)">Min % change</label>
+    <input id="minpct" type="number" value="100" min="0" step="50"
+      style="width:120px;background:rgba(0,0,0,.35);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:8px 10px;font-size:14px;outline:none;font-family:inherit">
+    <button onclick="applyFilter()"
+      style="cursor:pointer;border:none;border-radius:9px;padding:9px 18px;font-weight:600;font-size:12px;color:#06101f;font-family:inherit;background:linear-gradient(120deg,var(--accent),#a98bff)">Filter</button>
+  </div>
   <div id="hint">drag to orbit&nbsp;&nbsp;/&nbsp;&nbsp;scroll to fly&nbsp;&nbsp;/&nbsp;&nbsp;hover a star for detail</div>
   <button id="reveal" onclick="document.getElementById('data').scrollIntoView({behavior:'smooth'})">Variable sources<span class="chev"></span></button>
 </div>
@@ -184,7 +192,7 @@ const controls=new OrbitControls(camera,renderer.domElement);
 controls.enableDamping=true; controls.dampingFactor=0.06; controls.autoRotate=true; controls.autoRotateSpeed=0.25;
 controls.minDistance=20; controls.maxDistance=1200;
 const composer=new EffectComposer(renderer); composer.addPass(new RenderPass(scene,camera));
-const bloom=new UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),0.7,0.5,0.25); composer.addPass(bloom);
+const bloom=new UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),0.45,0.45,0.35); composer.addPass(bloom);
 
 function softTexture(){const c=document.createElement('canvas');c.width=c.height=128;const g=c.getContext('2d');
   const gr=g.createRadialGradient(64,64,0,64,64,64);gr.addColorStop(0,'rgba(255,255,255,1)');gr.addColorStop(.25,'rgba(255,255,255,.5)');
@@ -234,12 +242,13 @@ function pctColor(pct){let t=(Math.log10(Math.max(pct,1))-LOG_LO)/(LOG_HI-LOG_LO
 
 // data-driven galaxy: cluster by the log flux signature
 let starPoints=null, starData=[];
+const nebulaGroup=new THREE.Group(); scene.add(nebulaGroup);
 const starMat=new THREE.ShaderMaterial({uniforms:{uProg:{value:0},uPixelRatio:{value:PIXR},uTex:{value:SOFT}},transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,
   vertexShader:`uniform float uProg;uniform float uPixelRatio;attribute float aSize;attribute vec3 aColor;attribute float aDelay;attribute vec3 aHome;varying vec3 vColor;varying float vE;
     void main(){vColor=aColor;float e=clamp((uProg-aDelay)/0.28,0.0,1.0);e=1.0-pow(1.0-e,3.0);vE=e;vec3 p=aHome*e;
     vec4 mv=modelViewMatrix*vec4(p,1.0);gl_PointSize=aSize*uPixelRatio*(300.0/-mv.z)*(0.2+0.8*e);gl_Position=projectionMatrix*mv;}`,
   fragmentShader:`uniform sampler2D uTex;varying vec3 vColor;varying float vE;void main(){vec4 t=texture2D(uTex,gl_PointCoord);if(t.a<0.02)discard;
-    vec3 c=vColor*(1.1+0.65*vE)+vec3(0.16)*pow(t.a,3.0);gl_FragColor=vec4(c,t.a*vE);}`});
+    vec3 c=vColor*(0.9+0.5*vE)+vec3(0.12)*pow(t.a,3.0);gl_FragColor=vec4(c,t.a*vE);}`});
 let explodeStart=0;
 
 function feat(d){ // 5D signature -> log space (fluxes span many orders of magnitude)
@@ -252,9 +261,11 @@ function buildGalaxy(data){
   const F=data.map(feat); const mn=[1e9,1e9,1e9,1e9,1e9],mx=[-1e9,-1e9,-1e9,-1e9,-1e9];
   for(const f of F)for(let k=0;k<5;k++){mn[k]=Math.min(mn[k],f[k]);mx[k]=Math.max(mx[k],f[k]);}
   const norm=F.map(f=>f.map((v,k)=>{const d=mx[k]-mn[k];return d>1e-9?(v-mn[k])/d:0.5;}));
-  const rng=mulberry32(1337),K=16,att=[];
-  for(let k=0;k<K;k++){const ft=[rng(),rng(),rng(),rng(),rng()];const r=90+rng()*150,th=rng()*6.283,ph=Math.acos(2*rng()-1);
-    att.push({ft,pos:[r*Math.sin(ph)*Math.cos(th),(rng()-.5)*120,r*Math.sin(ph)*Math.sin(th)],spread:26+rng()*26});}
+  // attractors spread across a larger volume so clusters read as separate islands
+  const rng=mulberry32(1337),K=18,att=[];
+  for(let k=0;k<K;k++){const ft=[rng(),rng(),rng(),rng(),rng()];const r=150+rng()*260,th=rng()*6.283,ph=Math.acos(2*rng()-1);
+    att.push({ft,pos:[r*Math.sin(ph)*Math.cos(th),(rng()-.5)*220,r*Math.sin(ph)*Math.sin(th)],
+      spread:34+rng()*30,cx:0,cy:0,cz:0,count:0,hex:NEB[k%NEB.length]});}
   const P=[];for(let i=0;i<15;i++)P.push(rng()*2-1);
   const pos=new Float32Array(n*3),col=new Float32Array(n*3),size=new Float32Array(n),delay=new Float32Array(n);
   for(let i=0;i<n;i++){const f=norm[i];let best=0,bd=1e9;
@@ -263,15 +274,24 @@ function buildGalaxy(data){
     const ox=res[0]*P[0]+res[1]*P[1]+res[2]*P[2]+res[3]*P[3]+res[4]*P[4];
     const oy=res[0]*P[5]+res[1]*P[6]+res[2]*P[7]+res[3]*P[8]+res[4]*P[9];
     const oz=res[0]*P[10]+res[1]*P[11]+res[2]*P[12]+res[3]*P[13]+res[4]*P[14];
-    const x=a.pos[0]+ox*a.spread*2.2+(rng()-.5)*a.spread,y=a.pos[1]+oy*a.spread*2.2+(rng()-.5)*a.spread,z=a.pos[2]+oz*a.spread*2.2+(rng()-.5)*a.spread;
+    const x=a.pos[0]+ox*a.spread*2.4+(rng()-.5)*a.spread,y=a.pos[1]+oy*a.spread*2.4+(rng()-.5)*a.spread,z=a.pos[2]+oz*a.spread*2.4+(rng()-.5)*a.spread;
     pos[i*3]=x;pos[i*3+1]=y;pos[i*3+2]=z;
+    a.count++;a.cx+=x;a.cy+=y;a.cz+=z;
     const c=pctColor(data[i].percentage_change);col[i*3]=c.r;col[i*3+1]=c.g;col[i*3+2]=c.b;
-    size[i]=7+Math.min(Math.log10(Math.max(data[i].percentage_change,1)),12)*1.4;
+    size[i]=5+Math.min(Math.log10(Math.max(data[i].percentage_change,1)),12)*1.1;  // smaller = less blowout
     delay[i]=0.72*(i/n)+rng()*0.18;}
   const g=new THREE.BufferGeometry();
   g.setAttribute('aHome',new THREE.BufferAttribute(pos,3));g.setAttribute('position',new THREE.BufferAttribute(pos.slice(),3));
   g.setAttribute('aColor',new THREE.BufferAttribute(col,3));g.setAttribute('aSize',new THREE.BufferAttribute(size,1));g.setAttribute('aDelay',new THREE.BufferAttribute(delay,1));
   starPoints=new THREE.Points(g,starMat);starPoints.frustumCulled=false;scene.add(starPoints);
+
+  // soft nebula clouds on each real cluster centroid; they fade as you fly through
+  nebulaGroup.clear();
+  att.forEach(a=>{if(a.count<15)return;const cx=a.cx/a.count,cy=a.cy/a.count,cz=a.cz/a.count;
+    for(let l=0;l<3;l++){const m=new THREE.SpriteMaterial({map:SOFT,color:a.hex,transparent:true,opacity:0,depthWrite:false,blending:THREE.AdditiveBlending});
+      const sp=new THREE.Sprite(m);sp.position.set(cx+(rng()-.5)*30,cy+(rng()-.5)*30,cz+(rng()-.5)*30);
+      const s=a.spread*(5+l*2.6);sp.scale.set(s,s,1);sp.userData.base=0.16-l*0.04;nebulaGroup.add(sp);}});
+
   starMat.uniforms.uProg.value=0;explodeStart=performance.now();
 }
 
@@ -294,6 +314,10 @@ function galaxyVisible(){return !document.hidden && scrollY<innerHeight*0.9;}
 function loop(){if(!galaxyVisible()){running=false;return;}requestAnimationFrame(loop);const dt=Math.min(clock.getDelta(),0.05);frame++;
   if(frame&1){const p=spores.geometry.attributes.position,v=spores.userData.vel;for(let i=0;i<p.count;i++){p.array[i*3]+=v[i*3];p.array[i*3+1]+=v[i*3+1];p.array[i*3+2]+=v[i*3+2];if(Math.abs(p.array[i*3+1])>220)v[i*3+1]*=-1;}p.needsUpdate=true;}
   if(explodeStart){starMat.uniforms.uProg.value=Math.min((performance.now()-explodeStart)/3000,1);if(starPoints)starPoints.rotation.y+=dt*0.015;}
+  // nebula clouds fade out as the camera flies close to them, and drift with the galaxy
+  nebulaGroup.rotation.y=starPoints?starPoints.rotation.y:0;
+  nebulaGroup.children.forEach(sp=>{const d=camera.position.distanceTo(sp.getWorldPosition(new THREE.Vector3()));
+    sp.material.opacity=sp.userData.base*Math.min(Math.max((d-40)/160,0),1);});
   if(starfieldMat)starfieldMat.uniforms.uTime.value=clock.elapsedTime;
   controls.update();if(pickDirty){pick();pickDirty=false;}composer.render();}
 function startLoop(){if(!running){running=true;clock.getDelta();requestAnimationFrame(loop);}}
@@ -344,8 +368,10 @@ function renderTable(){
 window.sortBy=c=>{asc=(c===sortCol)?!asc:false;sortCol=c;page=1;renderTable();};
 window.go=d=>{const n=page+d;if(n<1||n>pages())return;page=n;renderTable();};
 window.backToSky=()=>window.scrollTo({top:0,behavior:'smooth'});
-window.applyFilter=()=>{const m=parseFloat($('minpct').value)||0;filtered=ALL.filter(r=>r.percentage_change>=m);page=1;
-  buildGalaxy(galaxySample(filtered));renderTable();};
+window.applyFilter=(fromData)=>{const m=parseFloat((fromData?$('minpct2'):$('minpct')).value)||0;
+  $('minpct').value=m; $('minpct2').value=m;           // keep both filter inputs in sync
+  filtered=ALL.filter(r=>r.percentage_change>=m); page=1;
+  buildGalaxy(galaxySample(filtered)); renderTable();};
 
 function onScroll(){document.body.classList.toggle('at-data',scrollY>innerHeight*0.35);if(galaxyVisible())startLoop();}
 addEventListener('scroll',onScroll,{passive:true});
@@ -371,6 +397,34 @@ async function init(){
   }
 }
 addEventListener('resize',()=>{const ns=computePageSize();if(ns!==PAGE_SIZE){PAGE_SIZE=ns;renderTable();}});
+
+// slow comets on a gentle arc (CSS transforms; independent of the WebGL loop)
+(function comets(){
+  const el=document.createElement('div'); el.className='comet'; document.body.appendChild(el);
+  function fly(){
+    if(document.hidden){setTimeout(fly,4000);return;}
+    const W=innerWidth,H=innerHeight;
+    const fromLeft=Math.random()<0.5;
+    const sx=fromLeft?-200:Math.random()*W*0.6, sy=fromLeft?Math.random()*H*0.5:-160;
+    const ang=(15+Math.random()*40)*Math.PI/180, dist=Math.hypot(W,H)+400;
+    const ex=sx+Math.cos(ang)*dist, ey=sy+Math.sin(ang)*dist;
+    const mx=(sx+ex)/2,my=(sy+ey)/2,nx=-Math.sin(ang),ny=Math.cos(ang);
+    const bow=(Math.random()<0.5?-1:1)*(dist*(0.10+Math.random()*0.14));
+    const cx=mx+nx*bow, cy=my+ny*bow, dur=5200+Math.random()*4200;
+    const N=16,frames=[];let px=sx,py=sy;
+    for(let i=0;i<=N;i++){const t=i/N,u=1-t;
+      const x=u*u*sx+2*u*t*cx+t*t*ex, y=u*u*sy+2*u*t*cy+t*t*ey;
+      const deg=Math.atan2(y-py,x-px)*180/Math.PI;px=x;py=y;
+      let op=0.9;if(t<0.12)op=t/0.12*0.9;else if(t>0.85)op=(1-t)/0.15*0.9;
+      frames.push({offset:t,opacity:op,transform:`translate3d(${x}px,${y}px,0) rotate(${deg}deg)`});}
+    frames[0].opacity=0;frames[N].opacity=0;
+    el.style.transform=frames[0].transform;
+    el.animate(frames,{duration:dur,easing:'linear'});
+    setTimeout(fly,dur+20000+Math.random()*35000);
+  }
+  setTimeout(fly,12000+Math.random()*12000);
+})();
+
 window.__ready=true;
 init();
 </script>
