@@ -280,24 +280,6 @@ def write_part(path, out_path):
     return q
 
 
-def merge_parts(part_paths, out_path):
-    """Concatenate worker .part files into out_path with the CSV header. Done in
-    Python (fast bulk IO) rather than ObjectScript stream ReadLine (very slow).
-    Returns the number of data rows written."""
-    rows = 0
-    with open(out_path, "w", newline="") as out:
-        out.write(",".join(OUTPUT_HEADER) + "\n")
-        for p in part_paths:
-            if not os.path.exists(p):
-                continue
-            with open(p, "r") as f:
-                data = f.read()
-            if data:
-                out.write(data)
-                rows += data.count("\n")
-    return rows
-
-
 def _fmt(v):
     return "" if v is None else repr(v)
 

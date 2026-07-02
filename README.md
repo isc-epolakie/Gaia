@@ -1,11 +1,66 @@
 # Gaia DR3 Epoch-Photometry Variability Detector
 
-InterSystems Employee Programming Challenge #1. Given the Gaia DR3 epoch-photometry
-archive, this finds astronomical objects whose **BP or RP flux changed by more than
-100%** across the observation period and writes the result to a CSV.
+**InterSystems Employee Programming Challenge #1.** Given the Gaia DR3 epoch-photometry
+archive, this finds astronomical objects whose **BP or RP flux changed by more than 100%**
+across the observation period, writes the result to a CSV, and — as a bonus — renders the
+result set as an interactive **3D galaxy** you can fly through.
 
-Built on the official `intersystems-challenge1-docker-template`: IRIS Community Edition
-in Docker, driven by `do ^RunScript`. The analysis runs in **embedded Python** inside IRIS.
+Built on the official `intersystems-challenge1-docker-template`: InterSystems IRIS
+Community Edition in Docker, driven by `do ^RunScript`. It is **IRIS-native by design**
+(see below), and processes the full 20-file benchmark in **~1.5 seconds**.
+
+---
+
+## Quick start
+
+Prerequisites: [git](https://git-scm.com) and [Docker Desktop](https://www.docker.com/products/docker-desktop).
+
+```bash
+git clone https://github.com/isc-epolakie/Gaia.git
+cd Gaia
+docker compose up --build -d
+```
+
+Produce the result CSV (this is what the challenge grades):
+
+```bash
+docker compose exec iris iris session iris
+USER> do ^RunScript
+```
+
+That writes `data/out/results.csv` and prints the qualifying-source count and the elapsed
+time. Everything needed (the analyzer classes, the C extensions, the routine) is compiled
+into the image at build time, so `do ^RunScript` works immediately with no further setup.
+
+**See the galaxy (optional, recommended):**
+
+```bash
+docker compose exec iris bash scripts/setup_web.sh    # one-time web provisioning
+```
+
+then open **http://localhost:52773/csp/gaia/ui/index.html**.
+
+---
+
+## The interactive 3D galaxy
+
+<!-- The UI visualises the exact result set do ^RunScript produces. -->
+
+The web UI turns the results CSV into a living star map (Three.js + WebGL, served straight
+from the IRIS Community built-in web server — no extra infrastructure):
+
+- **Every point is a real qualifying Gaia source.** Sources are grouped into clusters by a
+  projection of their full flux signature, so similar objects sit together.
+- **Colour encodes variability** — cool blue for the more modest changes through to hot red
+  for the extreme ones (log-scaled, because the values span many orders of magnitude).
+- **Fly through it.** Drag to orbit, scroll to zoom, hover any star for its source ID and
+  flux range. A **threshold slider** re-queries the sky live; a twinkling starfield,
+  drifting nebulae and the occasional comet keep it alive.
+- **Scroll down** for a sortable, paginated table of the same results.
+
+The render loop pauses when the galaxy is off-screen, so it stays light.
+
+---
 
 ## What it computes
 
@@ -14,141 +69,158 @@ For each `source_id` in the 20 benchmark files
 
 1. Read the per-transit `bp_flux` and `rp_flux` arrays.
 2. Keep only **valid** flux values (see below).
-3. For each band, `min_flux = min`, `max_flux = max`, and
+3. Per band: `min_flux = min`, `max_flux = max`,
    `percentage_change = ((max_flux − min_flux) / min_flux) × 100`.
 4. The source's `percentage_change` is the **larger** of the BP and RP values.
 5. Emit the source only if `percentage_change > 100`.
+
+**Output** — `data/out/results.csv`, header + one qualifying source per line
+(~57,000 rows), sorted by `percentage_change` descending:
+
+```
+source_id,bp_min_flux,bp_max_flux,rp_min_flux,rp_max_flux,percentage_change
+```
+
+A band with no valid flux leaves its two columns blank.
 
 ### What counts as a valid flux value
 
 The task says to ignore "missing, null, NaN, or otherwise invalid flux values." We treat a
 value as valid only if it parses as a **finite number and is strictly positive (> 0)**.
 Negative and zero fluxes are unphysical — Gaia itself flags negative flux as rejected
-(`variability_flag_*_reject`) — and dividing by a zero or negative `min_flux` would make the
+(`variability_flag_*_reject`) — and dividing by a zero/negative `min_flux` would make the
 percentage meaningless. Everything else (NaN, empty, `null`, non-numeric, ≤ 0) is dropped.
+Under this rule roughly **75%** of sources exceed 100% (epoch photometry captures real
+transits with large swings), so big percentages are expected and kept as-is.
 
-With this rule roughly **75%** of sources exceed 100% change — epoch photometry captures
-real transits with large flux swings, so big percentages (including very large ones from
-near-zero minima) are expected and kept as-is, per the literal formula.
+---
 
-### Output
+## IRIS-native by design
 
-`data/out/results.csv`, with a header row and one qualifying source per line:
+This is a deliberate choice, not just a template requirement: the solution leans on
+InterSystems IRIS as the platform rather than treating it as a shell around an external
+data tool.
 
-```
-source_id,bp_min_flux,bp_max_flux,rp_min_flux,rp_max_flux,percentage_change
-```
+- **Parallelism is `%SYSTEM.WorkMgr`** — IRIS's own work-distribution framework fans the 20
+  files across worker *jobs* (separate processes), the idiomatic IRIS way to use every core.
+- **The engine is embedded Python** (`%SYS.Python`), called from an ObjectScript routine
+  (`^RunScript`) — earning the Python bonus while keeping the whole thing inside IRIS.
+- **Serving the UI is IRIS too** — the built-in web server hosts both the REST-free static
+  page and the results file; there is no separate web stack to stand up.
 
-A band with no valid flux leaves its two columns blank. Rows are sorted by
-`percentage_change` descending. (~57,000 rows for the 20-file benchmark.)
+The performance work (below) reaches a decompression-bound floor **without** leaving this
+IRIS-native shape.
+
+---
 
 ## How it works
 
 ```
-data/in/EpochPhotometry_*.csv.gz   (20 gzipped ECSV files, shipped with the template)
+data/in/EpochPhotometry_*.csv.gz   (20 gzipped ECSV files, shipped with the repo)
       │
-   src/RunScript.mac   ← graders run  do ^RunScript
+   src/RunScript.mac   ← graders run:  do ^RunScript
       │  times the run, then calls the parallel coordinator
       ▼
-   Gaia.Analyze.Run (ObjectScript)
-      │  fans the 20 files across %SYSTEM.WorkMgr worker jobs — each a separate
-      │  process with its own embedded Python, so parsing scales across CPU cores
-      │  with no GIL contention
-      ├───► Gaia.Work.ProcessFile → gaia.analyze.write_part   (one worker per file)
-      │        • gunzip + skip the ECSV '#' header lines
-      │        • extract source_id / bp_flux / rp_flux (fast positional parse)
-      │        • keep finite & >0 flux, per-band min/max/%, take the max, keep >100
-      │        • write qualifying rows to a per-file .part
+   Gaia.Analyze.Run  (ObjectScript)
+      │  queues the 20 files (biggest first) across %SYSTEM.WorkMgr worker jobs —
+      │  each a separate process with its own embedded Python, so work scales
+      │  across CPU cores with no GIL contention
+      ├──► Gaia.Work.ProcessFile → ckernel.analyze_to_file   (one worker per file)
+      │        C kernel: libdeflate-decompress the gzip, scan the buffer for the
+      │        bp/rp flux cells, compute per-band min/max, write qualifying rows —
+      │        all in C; the 1.5 GB of decompressed text never enters Python
       ▼
-   gaia.analyze.merge_parts  →  data/out/results.csv   (header + all parts)
+   gaia.gmerge.merge_parts  →  data/out/results.csv   (header + concatenated parts)
 ```
 
 The files are **ECSV** (≈365 leading `#` comment lines, then a CSV header, then data), and
-`bp_flux`/`rp_flux` are **quoted arrays** like `"[NaN,50.0,…,157841.99]"` — the commas live
-inside the quotes. `gzip` streams each file a row at a time (flat memory, no extraction step).
+`bp_flux`/`rp_flux` are **quoted arrays** like `"[NaN,50.0,…,157841.99]"` — commas live
+inside the quotes, so the row can't be split naively. The layout is fixed, so the kernel
+locates the bp/rp arrays by position (still cross-checked against the header names).
 
-**Performance.** Profiling drove the 20-file run from ~16.5 s to **~1.6 s** (≈10×). In order
-of impact:
-1. *Parallelism (`%SYSTEM.WorkMgr`).* The 20 files are independent, so they are processed
-   concurrently across worker jobs — the idiomatic IRIS way to scale, and each worker has
-   its own Python interpreter so there is no GIL bottleneck.
-2. *Faster decompression (`isal`).* Decompression is ~⅔ of the work; `isal.igzip`
-   decompresses gzip ~2× faster than the stdlib. The analyzer falls back to stdlib `gzip`
-   if `isal` is absent, so it still runs anywhere.
-3. *Fast parse.* A row is 48 columns of mostly huge quoted arrays; `csv.reader` alone cost
-   ~6.8 s parsing all of it. We instead pull only the three fields we need — `source_id`
-   and the `bp_flux`/`rp_flux` array groups — walking the arrays with a regex and stopping
-   once both are found (the ~31 trailing array columns are never scanned). Columns are
-   still resolved from the header, so a layout change is detected, not mis-parsed. The
-   readable `csv`-based `analyze_file` is kept as a reference and a test asserts the fast
-   path matches it exactly. The fast path works entirely in **bytes** (no str decode).
-4. *C-level min/max (Cython).* The per-token `float()` + min/max loop was the biggest
-   remaining Python cost (~1.4 s); `src/gaia/fastmm.pyx` scans the raw bytes with `strtod`
-   ~3× faster, which hides the parse behind decompression. Compiled at image build into
-   user site-packages (see `scripts/build_fastmm.sh`); the analyzer falls back to pure
-   Python if it isn't built, so it runs anywhere.
-5. *Longest-processing-time-first scheduling.* Files vary 11–28 MB; queueing the biggest
-   first keeps a large file from becoming an end-of-run straggler. Beyond this the work is
-   memory-bandwidth-bound (decompression is ~⅔ of it) and parallel scaling plateaus.
+### Performance
 
-## Run it
+Every optimisation was verified to be both faster **and** byte-for-byte identical to the
+previous answer against a fixed reference. The 20-file run went from **~16.5 s to ~1.5 s**
+(≈10×):
 
-Prerequisites: [git](https://git-scm.com) and [Docker Desktop](https://www.docker.com/products/docker-desktop).
+1. **Parallelism (`%SYSTEM.WorkMgr`).** The 20 files are independent → processed
+   concurrently across worker jobs, each with its own Python interpreter (no GIL).
+2. **Fewer, cheaper worker imports.** Each worker imports only the tiny `ckernel`
+   extension (not the full analyzer), and the coordinator merges via a dependency-free
+   helper — importing the heavy module per worker cost ~0.9 s.
+3. **A C kernel (Cython + libdeflate).** Decompression is ~⅔ of the work. `src/gaia/ckernel.pyx`
+   decompresses each file with **libdeflate** and scans the raw bytes with `strtod`,
+   computing min/max and writing the CSV rows entirely in C — nothing but the final rows
+   crosses into Python. (We measured `isal` and pure-Python paths too; they're kept as
+   automatic fallbacks so the app still runs if the C kernel isn't built.)
+4. **Longest-processing-time-first scheduling.** Files vary 11–28 MB; queueing the biggest
+   first stops a large file from becoming an end-of-run straggler.
 
-```bash
-docker-compose up --build -d
-docker-compose exec iris iris session iris
-USER>do ^RunScript
-```
+Beyond this the job is **decompression-bound and memory-bandwidth-limited** — the time to
+push ~1.5 GB of decompressed text through the fastest decoder — which is a hard floor.
 
-`RunScript` and the `Gaia.*` classes are pre-compiled into the USER namespace at image
-build time (see `iris.script`), so `do ^RunScript` is ready to run immediately. It prints
-the number of sources over 100%, the output path, and the elapsed time, and writes
-`data/out/results.csv`.
+### Robustness
+
+The worker and analyzer degrade gracefully through three tiers, so the app always produces
+correct output even where the C toolchain isn't available:
+**C kernel (`ckernel`) → Cython min/max (`fastmm`) + `isal` → pure-Python + stdlib `gzip`.**
+Host unit tests run the pure-Python path; an in-container test asserts the C kernel matches
+the reference on every row.
+
+---
 
 ## Tests
 
-The analyzer is plain Python (no IRIS dependency), so its parsing and math are unit-tested on
-the host:
+The analyzer core is plain Python (no IRIS dependency), so its parsing and math are
+unit-tested on the host:
 
 ```bash
 PYTHONPATH=src python -m pytest tests/ -v
 ```
+
+(The C-kernel parity test skips automatically when run outside the container, where the
+compiled `ckernel` and the real data aren't present.)
+
+---
 
 ## Project layout
 
 | Path | What |
 |---|---|
 | `src/RunScript.mac` | ObjectScript entrypoint the graders run (`do ^RunScript`) |
-| `src/Gaia/Analyze.cls` | parallel coordinator: fan the files across WorkMgr, merge results |
-| `src/Gaia/Work.cls` | one WorkMgr unit: analyze a single file via embedded Python |
-| `src/gaia/analyze.py` | embedded-Python analyzer (parse → per-band min/max/% → filter → CSV) |
-| `src/gaia/fastmm.pyx` | Cython C-level min/max over a flux cell (compiled at build; optional) |
-| `scripts/build_fastmm.sh` | compiles fastmm into user site-packages during the image build |
-| `tests/test_analyze.py` | host unit tests: parsing, math, and fast/reference parity |
-| `iris.script` | build-time setup; pre-compiles `src/*.cls` + `src/*.mac` into USER |
-| `data/in/` | the 20 benchmark `.csv.gz` files (from the template) |
+| `src/gaia/Analyze.cls` | parallel coordinator: fan files across WorkMgr, merge results |
+| `src/gaia/Work.cls` | one WorkMgr unit: analyze a single file (C kernel, with fallback) |
+| `src/gaia/ckernel.pyx` | **C kernel** — libdeflate decompress + scan + write, all in C |
+| `src/gaia/fastmm.pyx` | Cython C-level min/max over a flux cell (fallback path) |
+| `src/gaia/analyze.py` | pure-Python analyzer + reference implementation (fallback / tests) |
+| `src/gaia/gmerge.py` | dependency-free part-file merge used by the coordinator |
+| `scripts/build_fastmm.sh` | compiles `ckernel` + `fastmm` into the image at build time |
+| `scripts/setup_web.sh` | provisions the web UI apps on the IRIS web server |
+| `web/index.html` | the interactive 3D galaxy (Three.js) |
+| `tests/test_analyze.py` | host unit tests: parsing, math, fast/reference parity |
+| `iris.script` | build-time setup; compiles `src/*.cls` + `src/*.mac` into USER |
+| `data/in/` | the 20 benchmark `.csv.gz` files |
 | `data/out/results.csv` | generated output (gitignored) |
 | `docs/` | design spec |
 
+---
+
 ## Notes / feedback (as the contest requests)
 
-- **Embedded Python was a great fit.** The hardest part of the data is the quoted flux
-  arrays; Python's `csv` + `float()` handle the quoting and NaN with almost no code, and
-  `gzip` streams the ECSV files directly — no LOAD DATA gymnastics (which wouldn't fit
-  array-valued text anyway).
-- Calling Python from `RunScript.mac` via `##class(%SYS.Python).Import(...)` is clean; the
-  one quirk was reading a returned Python tuple from ObjectScript, done with
-  `result."__getitem__"(0)`.
-- Getting the classes + routine auto-loaded so `do ^RunScript` "just works" needed
-  `$System.OBJ.ImportDir(dir,"*.cls","ck",,1)` then `...,"*.mac",...` in `iris.script` —
-  a single `ImportDir` wildcard only handles one file type, and `LoadDir` without the
-  wildcard silently loaded nothing.
-- **`%SYSTEM.WorkMgr` was the right tool for the speedup.** The 20 files are independent,
-  so fanning them across worker jobs (separate processes, each with its own embedded
-  Python) sidesteps the GIL and scales across cores. Worth knowing: WorkMgr suppresses
-  `Write` output from inside the coordination, and the win only appears once the classes
-  are actually recompiled into the image (a stale compiled `^RunScript` will keep running
-  the old code — rebuild after changes).
-- Columns are located by name, never by index, so a future column-order change can't
-  silently corrupt the result.
+- **Embedded Python is a great fit for this data.** The quoted flux arrays are the awkward
+  part; Python's `csv`/`float` handle them with almost no code for the reference path, and
+  dropping to a C kernel for the hot loop was straightforward from there.
+- **`%SYSTEM.WorkMgr` is the right IRIS tool for the speedup** — worker jobs are separate
+  processes, so they sidestep the GIL and use every core. Two gotchas worth recording:
+  WorkMgr suppresses `Write` output from inside the coordination, and compiled code must be
+  rebuilt into the image to take effect (a stale compiled `^RunScript` silently runs the old
+  logic).
+- **Auto-loading** so `do ^RunScript` "just works" needed
+  `$System.OBJ.ImportDir(dir,"*.cls",…)` then `…,"*.mac",…` in `iris.script` — one
+  `ImportDir` wildcard handles only one file type.
+- **libdeflate without dev headers:** the image ships `libdeflate.so.0` but no header, so
+  the Cython kernel declares the few prototypes inline and links against the existing
+  shared object.
+- Columns are located by (fixed, header-verified) position, so a future column-order change
+  is detected rather than silently mis-parsed.
