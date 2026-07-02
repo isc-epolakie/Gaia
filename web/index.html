@@ -279,7 +279,7 @@ function buildGalaxy(data){
 const ray=new THREE.Raycaster();ray.params.Points.threshold=4;const mouse=new THREE.Vector2();let hoverIdx=-1,pickDirty=false;
 const tip=document.getElementById('tip');
 addEventListener('pointermove',e=>{mouse.x=(e.clientX/innerWidth)*2-1;mouse.y=-(e.clientY/innerHeight)*2+1;tip.style.left=(e.clientX+16)+'px';tip.style.top=(e.clientY+16)+'px';pickDirty=true;});
-function fmtNum(v){if(v===''||v==null)return '—';const n=+v;return n>=1e4?n.toExponential(2):n.toFixed(2);}
+function fmtNum(v){if(v===''||v==null)return '-';const n=+v;return n>=1e4?n.toExponential(2):n.toFixed(2);}
 function pick(){if(!starPoints||starMat.uniforms.uProg.value<0.9||scrollY>innerHeight*0.4){tip.style.opacity=0;return;}
   ray.setFromCamera(mouse,camera);const hit=ray.intersectObject(starPoints);
   if(hit.length){const i=hit[0].index;if(i!==hoverIdx){hoverIdx=i;const d=starData[i];const col=pctColor(d.percentage_change).getStyle();
@@ -306,7 +306,7 @@ let ALL=[], filtered=[], page=1, sortCol=null, asc=false;
 const pages=()=>Math.max(1,Math.ceil(filtered.length/PAGE_SIZE));
 
 // Even stride across the (pct-desc-sorted) set so the galaxy samples the whole
-// range of variability — not just the most extreme (reddest) sources.
+// range of variability, not just the most extreme (reddest) sources.
 function galaxySample(rows){
   if(rows.length<=GALAXY_N) return rows.slice();
   const step=rows.length/GALAXY_N, out=[];
@@ -365,9 +365,9 @@ async function init(){
     startLoop();
     $('veil').classList.add('hide');setTimeout(()=>$('veil').style.display='none',900);
   }catch(e){
-    $('veilmsg').textContent='Could not load results.csv — run  do ^RunScript  then  bash scripts/setup_web.sh';
+    $('veilmsg').textContent='Could not load results.csv - run  do ^RunScript  then  bash scripts/setup_web.sh';
     $('stat').textContent='no results.csv';
-    const b=$('banner');b.style.display='block';b.textContent='results.csv not found at '+DATA_URL+' — generate it with do ^RunScript.';
+    const b=$('banner');b.style.display='block';b.textContent='results.csv not found at '+DATA_URL+' - generate it with do ^RunScript.';
   }
 }
 addEventListener('resize',()=>{const ns=computePageSize();if(ns!==PAGE_SIZE){PAGE_SIZE=ns;renderTable();}});
