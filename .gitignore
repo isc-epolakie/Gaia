@@ -1,5 +1,10 @@
 .DS_Store
 
+# generated output + local scratch
+data/out/
+__pycache__/
+*.pyc
+.pytest_cache/
 
 data/temp/EpochPhotometry_003112-005263.csv
 data/temp/EpochPhotometry_005264-006601.csv

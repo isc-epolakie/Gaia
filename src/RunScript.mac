@@ -1,20 +1,30 @@
 ROUTINE RunScript
- #; We will run this routine to do the benchmark
+ #; We will run this routine to do the benchmark:  do ^RunScript
 Run()
 {
- #; extract files if necessary from .data/in to .data/temp
+ #; Paths inside the container (the repo is mounted at /home/irisowner/dev)
+ Set base = "/home/irisowner/dev"
+ Set inDir = base_"/data/in"
+ Set outPath = base_"/data/out/results.csv"
 
  #; Start time
  Set startTime = $ZHOROLOG
 
- #; Insert the call to your method/rountine that
- #; - reads the csv files from ./data/in or .data/temp
- #; - processes data
- #; - creates output file in .data/out
+ #; Make the embedded-Python analyzer importable, then run it. The analyzer
+ #; streams the 20 gzipped ECSV files, keeps valid (finite, >0) BP/RP flux,
+ #; computes per-band ((max-min)/min)*100, takes the larger of the two, and
+ #; writes data/out/results.csv (with header) for sources above 100%.
+ Set sys = ##class(%SYS.Python).Import("sys")
+ Do sys.path.append(base_"/src")
+ Set analyze = ##class(%SYS.Python).Import("gaia.analyze")
+ Set result = analyze.run(inDir, outPath)   ; returns (seen, qualified)
 
  #; End time
  Set endTime = $ZHOROLOG
- #; Elapsed time in seconds
  Set elapsed = endTime - startTime
+
+ Write "Sources scored:    ", result."__getitem__"(0), !
+ Write "Sources over 100%: ", result."__getitem__"(1), !
+ Write "Output written to: ", outPath, !
  Write "Elapsed time: ", elapsed, " seconds", !
 }
