@@ -11,10 +11,10 @@ the source only when that exceeds 100%.
 Design notes / feedback (the contest asks for these):
 - The files are ECSV: ~365 leading '#' comment lines, then a CSV header, then data.
   We skip every line starting with '#'.
-- bp_flux / rp_flux are QUOTED arrays like "[NaN,50.0,...]" — the commas are inside
+- bp_flux / rp_flux are QUOTED arrays like "[NaN,50.0,...]" - the commas are inside
   the quotes, so a naive split of the whole row breaks. There are two paths here:
-  * analyze_file() — readable reference using csv.reader (handles the quoting for free).
-  * analyze_file_fast() — the production path. csv.reader spends ~6.8s parsing all 48
+  * analyze_file() - readable reference using csv.reader (handles the quoting for free).
+  * analyze_file_fast() - the production path. csv.reader spends ~6.8s parsing all 48
     columns' quoting; we instead extract only source_id and the bp/rp array groups, cutting
     the single-thread parse from ~15.7s to ~11s. A test asserts the two paths agree exactly.
   The files are then fanned across %SYSTEM.WorkMgr workers (see src/Gaia/*.cls), taking the
