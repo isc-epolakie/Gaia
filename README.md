@@ -122,15 +122,18 @@ data/in/EpochPhotometry_*.csv.gz   (20 gzipped ECSV files, shipped with the repo
       │  times the run, then calls the parallel coordinator
       ▼
    Gaia.Analyze.Run  (ObjectScript)
-      │  queues the 20 files (biggest first) across %SYSTEM.WorkMgr worker jobs —
-      │  each a separate process with its own embedded Python, so work scales
-      │  across CPU cores with no GIL contention
-      ├──► Gaia.Work.ProcessFile → ckernel.analyze_to_file   (one worker per file)
-      │        C kernel: libdeflate-decompress the gzip, scan the buffer for the
-      │        bp/rp flux cells, compute per-band min/max, write qualifying rows —
-      │        all in C; the 1.5 GB of decompressed text never enters Python
+      │  Python-side plan(): glob + size-sort the files (biggest first), then
+      │  queue them across %SYSTEM.WorkMgr worker jobs — each a separate process
+      │  with its own embedded Python, so work scales across cores with no GIL
       ▼
-   gaia.gmerge.merge_parts  →  data/out/results.csv   (header + concatenated parts)
+   Gaia.Work.ProcessFile → ckernel.analyze_to_shared   (one worker per file)
+         C kernel: libdeflate-decompress the gzip, scan the buffer for the bp/rp
+         flux cells, compute per-band min/max, and append the qualifying rows
+         straight to data/out/results.csv in one flock-guarded write() — all in
+         C. The 1.5 GB of decompressed text never enters Python, and there is no
+         separate merge pass.
+      ▼
+   data/out/results.csv
 ```
 
 The files are **ECSV** (≈365 leading `#` comment lines, then a CSV header, then data), and
@@ -146,15 +149,18 @@ previous answer against a fixed reference. The 20-file run went from **~16.5 s t
 
 1. **Parallelism (`%SYSTEM.WorkMgr`).** The 20 files are independent → processed
    concurrently across worker jobs, each with its own Python interpreter (no GIL).
-2. **Fewer, cheaper worker imports.** Each worker imports only the tiny `ckernel`
-   extension (not the full analyzer), and the coordinator merges via a dependency-free
-   helper — importing the heavy module per worker cost ~0.9 s.
-3. **A C kernel (Cython + libdeflate).** Decompression is ~⅔ of the work. `src/gaia/ckernel.pyx`
+2. **A C kernel (Cython + libdeflate).** Decompression is ~⅔ of the work. `src/gaia/ckernel.pyx`
    decompresses each file with **libdeflate** and scans the raw bytes with `strtod`,
-   computing min/max and writing the CSV rows entirely in C — nothing but the final rows
-   crosses into Python. (We measured `isal` and pure-Python paths too; they're kept as
-   automatic fallbacks so the app still runs if the C kernel isn't built.)
-4. **Longest-processing-time-first scheduling.** Files vary 11–28 MB; queueing the biggest
+   computing min/max entirely in C — nothing but the final rows crosses into Python.
+   (We measured `isal` and pure-Python paths too; they're kept as automatic fallbacks so
+   the app still runs if the C kernel isn't built.)
+3. **No merge pass.** Workers append their rows directly to the one output CSV under an
+   `flock` (each writes its whole buffer in a single `write()`, so lines never interleave),
+   removing a separate concatenation step. Each worker imports only the tiny `ckernel`
+   extension, not the full analyzer (that had cost ~0.9 s across workers).
+4. **Cheap coordination.** File discovery is a Python `glob` + size-sort (~0.03 s vs ~0.18 s
+   for ObjectScript `FileSetFunc`).
+5. **Longest-processing-time-first scheduling.** Files vary 11–28 MB; queueing the biggest
    first stops a large file from becoming an end-of-run straggler.
 
 ### Robustness
@@ -191,7 +197,7 @@ compiled `ckernel` and the real data aren't present.)
 | `src/gaia/ckernel.pyx` | **C kernel** — libdeflate decompress + scan + write, all in C |
 | `src/gaia/fastmm.pyx` | Cython C-level min/max over a flux cell (fallback path) |
 | `src/gaia/analyze.py` | pure-Python analyzer + reference implementation (fallback / tests) |
-| `src/gaia/gmerge.py` | dependency-free part-file merge used by the coordinator |
+| `src/gaia/gmerge.py` | dependency-free coordinator helpers (file discovery/plan, output init; part merge for the fallback path) |
 | `scripts/build_fastmm.sh` | compiles `ckernel` + `fastmm` into the image at build time |
 | `scripts/setup_web.sh` | provisions the web UI apps on the IRIS web server |
 | `web/index.html` | the interactive 3D galaxy (Three.js) |

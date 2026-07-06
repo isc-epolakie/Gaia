@@ -14,48 +14,47 @@ Parameter HEADER = "source_id,bp_min_flux,bp_max_flux,rp_min_flux,rp_max_flux,pe
 ClassMethod Run(inDir As %String, outPath As %String) As %Integer
 {
   Set tmpDir = "/home/irisowner/dev/data/temp/parts"
-  Do ##class(%File).CreateDirectoryChain(tmpDir)
-  Do ##class(%File).CreateDirectoryChain(##class(%File).GetDirectory(outPath))
+  Set sys = ##class(%SYS.Python).Import("sys")
+  Do sys.path.append("/home/irisowner/dev/src")
+  Set gmerge = ##class(%SYS.Python).Import("gaia.gmerge")
 
-  // Discover the input files, indexing them by DESCENDING size in `order` so we
-  // can queue the biggest first. Longest-processing-time-first scheduling keeps
-  // the large files from becoming end-of-run stragglers (measured ~2.1s -> ~1.5s).
-  Set rs = ##class(%File).FileSetFunc(inDir, "EpochPhotometry_*.csv.gz", , 1)
-  Set files = 0
-  While rs.%Next() {
-    Set files = files + 1
-    Set file(files) = rs.Name
-    Set part(files) = tmpDir_"/part_"_files_".csv"
-    // key = (maxSize - size) then index, so $ORDER visits biggest-first, ties stable
-    Set order(1000000000 - ##class(%File).GetFileSize(rs.Name) _ "_" _ files) = files
+  // Discover input files in Python: glob + size sort (biggest-first, for
+  // longest-processing-time-first scheduling) is ~0.03s vs ~0.18s for the
+  // ObjectScript FileSetFunc glob. Returns parallel (inputs, parts) lists.
+  Set plan = gmerge.plan(inDir, tmpDir)
+  Set files = plan."__getitem__"(0)      // list of input .csv.gz paths
+  Set parts = plan."__getitem__"(1)      // list of per-file .part paths
+  Set n = files."__len__"()
+
+  // Prefer the shared-append path: workers flock-append their rows straight to
+  // the output CSV, so there is no merge pass. Falls back to per-file parts +
+  // merge if the C kernel isn't available. Detect once, up front.
+  Set shared = 0
+  Try { Do ##class(%SYS.Python).Import("ckernel") Set shared = 1 } Catch { Set shared = 0 }
+
+  // For shared mode: (re)create the output with just the header; workers append.
+  If shared {
+    Do gmerge."init_output"(outPath)
+    Set sharedArg = outPath
+  } Else {
+    Set sharedArg = ""
   }
 
   // Fan out: one queued unit of work per file, biggest files first.
   Set q = ##class(%SYSTEM.WorkMgr).Initialize(, .sc)
   $$$ThrowOnError(sc)
-  Set key = ""
-  For {
-    Set key = $Order(order(key))
-    Quit:key=""
-    Set i = order(key)
-    Set sc = q.QueueCallback("##class(Gaia.Work).ProcessFile", "", file(i), part(i))
+  For i=0:1:n-1 {
+    Set sc = q.QueueCallback("##class(Gaia.Work).ProcessFile", "", files."__getitem__"(i), parts."__getitem__"(i), sharedArg)
     $$$ThrowOnError(sc)
   }
   $$$ThrowOnError(q.WaitForComplete())
 
-  // Merge the .part files into the final CSV in Python (fast bulk IO; the
-  // ObjectScript stream ReadLine loop was the bottleneck at this scale). Use the
-  // tiny gaia.gmerge module so the coordinator doesn't import the heavy analyzer.
-  Set sys = ##class(%SYS.Python).Import("sys")
-  Do sys.path.append("/home/irisowner/dev/src")
-  Set builtins = ##class(%SYS.Python).Import("builtins")
-  Set plist = builtins.list()
-  For i=1:1:files { Do plist.append(part(i)) }
-  Set total = ##class(%SYS.Python).Import("gaia.gmerge")."merge_parts"(plist, outPath)
-
-  // clean up the per-file parts
-  For i=1:1:files { Do ##class(%File).Delete(part(i)) }
-  Quit total
+  If shared {
+    // rows already in outPath; count them (cheap) for the return value
+    Quit gmerge."count_rows"(outPath)
+  }
+  // Fallback: merge the per-file parts into the final CSV (header + concat).
+  Quit gmerge."merge_parts"(parts, outPath)
 }
 
 }

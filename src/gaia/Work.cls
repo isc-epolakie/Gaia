@@ -1,11 +1,14 @@
-/// One unit of parallel work: analyze a single Gaia DR3 file and write its
-/// qualifying (>100%) rows to a per-file .part file. Runs inside a %SYSTEM.WorkMgr
-/// worker job (its own process + embedded Python, so no GIL contention).
+/// One unit of parallel work: analyze a single Gaia DR3 file and append its
+/// qualifying (>100%) rows straight to the shared output CSV. Runs inside a
+/// %SYSTEM.WorkMgr worker job (its own process + embedded Python, no GIL).
 ///
 /// The worker imports the tiny `ckernel` C extension directly (libdeflate
 /// decompress + scan + write, all in C) rather than the heavier gaia.analyze
 /// module — importing the full module in every worker cost ~0.9s of the run.
-/// Falls back to gaia.analyze.write_part if the C kernel isn't built.
+/// ckernel.analyze_to_shared appends every worker's rows to one file under an
+/// flock, in a single write() per worker, so there is no separate merge pass and
+/// no risk of interleaved lines. Falls back to a private part file + Python
+/// analyzer if the C kernel isn't built (the coordinator then merges parts).
 Class Gaia.Work
 {
 
@@ -15,14 +18,19 @@ Parameter BPGROUP = 8;
 
 Parameter RPGROUP = 13;
 
-/// Analyze file `inPath`, writing qualifying rows (no header) to `partPath`.
-ClassMethod ProcessFile(inPath As %String, partPath As %String) As %Status
+/// Analyze `inPath`; on the C-kernel path append rows to `sharedPath`, else write
+/// a private part file at `partPath` for the coordinator to merge.
+ClassMethod ProcessFile(inPath As %String, partPath As %String, sharedPath As %String = "") As %Status
 {
   Try {
     Set ck = ##class(%SYS.Python).Import("ckernel")
-    Do ck."analyze_to_file"(inPath, ..#BPGROUP, ..#RPGROUP, 100, partPath)
+    If sharedPath '= "" {
+      Do ck."analyze_to_shared"(inPath, ..#BPGROUP, ..#RPGROUP, 100, sharedPath)
+    } Else {
+      Do ck."analyze_to_file"(inPath, ..#BPGROUP, ..#RPGROUP, 100, partPath)
+    }
   } Catch {
-    // Fallback: pure-Python / Cython fast path via the analyzer module.
+    // Fallback: pure-Python / Cython fast path -> private part file (merged later).
     Set sys = ##class(%SYS.Python).Import("sys")
     Do sys.path.append("/home/irisowner/dev/src")
     Do ##class(%SYS.Python).Import("gaia.analyze")."write_part"(inPath, partPath)
