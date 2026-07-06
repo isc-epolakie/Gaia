@@ -44,7 +44,10 @@ then open **http://localhost:52773/csp/gaia/ui/index.html**.
 
 ## The interactive 3D galaxy
 
-<!-- The UI visualises the exact result set do ^RunScript produces. -->
+<!-- Crisp MP4 renders inline on GitHub; the GIF is a fallback for other viewers / offline clones. -->
+https://github.com/isc-epolakie/Gaia/raw/master/docs/demo.mp4
+
+![Gaia Atlas — interactive 3D galaxy of DR3 variable sources](docs/demo.gif)
 
 The web UI turns the results CSV into a living star map (Three.js + WebGL, served straight
 from the IRIS Community built-in web server — no extra infrastructure):
