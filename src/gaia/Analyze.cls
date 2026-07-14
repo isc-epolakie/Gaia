@@ -19,6 +19,12 @@ Parameter HEADER = "source_id,bp_min_flux,bp_max_flux,rp_min_flux,rp_max_flux,pe
 /// Run the whole pipeline. Returns the number of qualifying rows written.
 ClassMethod Run(inDir As %String, outPath As %String) As %Integer
 {
+  // The output dir (and, for the fallback, the parts scratch dir) are gitignored,
+  // so they may not exist on a fresh clone. Ensure both before writing to them.
+  Set tmpDir = "/home/irisowner/dev/data/temp/parts"
+  Do ##class(%File).CreateDirectoryChain(##class(%File).GetDirectory(outPath))
+  Do ##class(%File).CreateDirectoryChain(tmpDir)
+
   // Discover the input files and order them biggest-first (longest-processing-
   // time-first scheduling), entirely in ObjectScript. $ZSEARCH + GetFileSize is
   // ~0.01s and, unlike the Python glob, needs no interpreter in this process.
@@ -32,7 +38,7 @@ ClassMethod Run(inDir As %String, outPath As %String) As %Integer
   }
 
   // Prefer the shared-append C-kernel path; fall back to the pure-Python
-  // analyzer + merge only if the C kernel isn't importable in a worker.
+  // analyzer + merge only if the compiled C kernel isn't present.
   Set shared = ..CKernelAvailable()
 
   If shared {
@@ -43,8 +49,9 @@ ClassMethod Run(inDir As %String, outPath As %String) As %Integer
     Kill ^Gaia.RowCount
   }
 
-  // Fan out: one queued unit of work per file, biggest files first.
-  Set tmpDir = "/home/irisowner/dev/data/temp/parts"
+  // Fan out: one queued unit of work per file, biggest files first. On the shared
+  // path workers append straight to outPath; on the fallback each writes a private
+  // numbered part file for the coordinator to merge.
   Set q = ##class(%SYSTEM.WorkMgr).Initialize(, .sc)
   $$$ThrowOnError(sc)
   Set i = 0, sz = ""
@@ -89,9 +96,12 @@ ClassMethod Run(inDir As %String, outPath As %String) As %Integer
 /// Python-free coordinator). Workers still import the module themselves per job;
 /// if the .so is absent here it is absent for them too, so both take the
 /// pure-Python fallback consistently.
+///
+/// The pythonX.YY segment is wildcarded so an embedded-Python minor-version bump
+/// in the base image doesn't silently route every run to the slow fallback.
 ClassMethod CKernelAvailable() As %Boolean
 {
-  Quit ($ZSearch("/home/irisowner/.local/lib/python3.12/site-packages/ckernel*.so") '= "")
+  Quit ($ZSearch("/home/irisowner/.local/lib/python*/site-packages/ckernel*.so") '= "")
 }
 
 }
