@@ -121,10 +121,10 @@ data/in/EpochPhotometry_*.csv.gz   (20 gzipped ECSV files, shipped with the repo
    src/RunScript.mac   ← graders run:  do ^RunScript
       │  times the run, then calls the parallel coordinator
       ▼
-   Gaia.Analyze.Run  (ObjectScript)
-      │  Python-side plan(): glob + size-sort the files (biggest first), then
-      │  queue them across %SYSTEM.WorkMgr worker jobs — each a separate process
-      │  with its own embedded Python, so work scales across cores with no GIL
+   Gaia.Analyze.Run  (pure ObjectScript — no embedded Python in the coordinator)
+      │  $ZSEARCH + size-sort the files (biggest first), write the CSV header,
+      │  then queue them across %SYSTEM.WorkMgr worker jobs — each a separate
+      │  process with its own embedded Python, so work scales across cores with no GIL
       ▼
    Gaia.Work.ProcessFile → ckernel.analyze_to_shared   (one worker per file)
          C kernel: libdeflate-decompress the gzip, scan the buffer for the bp/rp
@@ -158,8 +158,15 @@ previous answer against a fixed reference. The 20-file run went from **~16.5 s t
    `flock` (each writes its whole buffer in a single `write()`, so lines never interleave),
    removing a separate concatenation step. Each worker imports only the tiny `ckernel`
    extension, not the full analyzer (that had cost ~0.9 s across workers).
-4. **Cheap coordination.** File discovery is a Python `glob` + size-sort (~0.03 s vs ~0.18 s
-   for ObjectScript `FileSetFunc`).
+4. **Pure-ObjectScript coordinator.** The coordinator does file discovery
+   (`$ZSEARCH` + size-sort), writes the CSV header (low-level `OPEN`/`WRITE`), and
+   reports the final row count entirely in ObjectScript, so it never imports
+   embedded Python. The first `%SYS.Python` call in a process pays a one-time
+   interpreter init (~0.04 s) plus module-import cost; keeping that out of the
+   coordinator trims ~0.12 s of fixed per-run overhead (the C kernel still runs in
+   the Python workers). Two pieces made this possible: `$ZSEARCH` discovery is
+   ~0.01 s (faster than the Python `glob`), and workers accumulate their row
+   counts in a shared global (`^Gaia.RowCount`) so the total needs no CSV re-read.
 5. **Longest-processing-time-first scheduling.** Files vary 11–28 MB; queueing the biggest
    first stops a large file from becoming an end-of-run straggler.
 
@@ -197,7 +204,7 @@ compiled `ckernel` and the real data aren't present.)
 | `src/gaia/ckernel.pyx` | **C kernel** — libdeflate decompress + scan + write, all in C |
 | `src/gaia/fastmm.pyx` | Cython C-level min/max over a flux cell (fallback path) |
 | `src/gaia/analyze.py` | pure-Python analyzer + reference implementation (fallback / tests) |
-| `src/gaia/gmerge.py` | dependency-free coordinator helpers (file discovery/plan, output init; part merge for the fallback path) |
+| `src/gaia/gmerge.py` | dependency-free helpers used only by the pure-Python fallback path (part-file merge) |
 | `scripts/build_fastmm.sh` | compiles `ckernel` + `fastmm` into the image at build time |
 | `scripts/setup_web.sh` | provisions the web UI apps on the IRIS web server |
 | `web/index.html` | the interactive 3D galaxy (Three.js) |

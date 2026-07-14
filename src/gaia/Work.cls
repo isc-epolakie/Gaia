@@ -25,7 +25,11 @@ ClassMethod ProcessFile(inPath As %String, partPath As %String, sharedPath As %S
   Try {
     Set ck = ##class(%SYS.Python).Import("ckernel")
     If sharedPath '= "" {
-      Do ck."analyze_to_shared"(inPath, ..#BPGROUP, ..#RPGROUP, 100, sharedPath)
+      // analyze_to_shared returns this file's qualifying-row count; accumulate it
+      // in a shared global so the coordinator needn't re-read the output CSV to
+      // learn the total ($INCREMENT is atomic across the worker processes).
+      Set rows = ck."analyze_to_shared"(inPath, ..#BPGROUP, ..#RPGROUP, 100, sharedPath)
+      Do $Increment(^Gaia.RowCount, rows)
     } Else {
       Do ck."analyze_to_file"(inPath, ..#BPGROUP, ..#RPGROUP, 100, partPath)
     }
