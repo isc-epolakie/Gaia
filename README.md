@@ -158,15 +158,18 @@ previous answer against a fixed reference. The 20-file run went from **~16.5 s t
    `flock` (each writes its whole buffer in a single `write()`, so lines never interleave),
    removing a separate concatenation step. Each worker imports only the tiny `ckernel`
    extension, not the full analyzer (that had cost ~0.9 s across workers).
-4. **Pure-ObjectScript coordinator.** The coordinator does file discovery
-   (`$ZSEARCH` + size-sort), writes the CSV header (low-level `OPEN`/`WRITE`), and
-   reports the final row count entirely in ObjectScript, so it never imports
-   embedded Python. The first `%SYS.Python` call in a process pays a one-time
-   interpreter init (~0.04 s) plus module-import cost; keeping that out of the
-   coordinator trims ~0.12 s of fixed per-run overhead (the C kernel still runs in
-   the Python workers). Two pieces made this possible: `$ZSEARCH` discovery is
-   ~0.01 s (faster than the Python `glob`), and workers accumulate their row
-   counts in a shared global (`^Gaia.RowCount`) so the total needs no CSV re-read.
+4. **Pure-ObjectScript coordinator.** This is only about the *coordinator*
+   process — the worker jobs still run the engine through embedded Python (each
+   imports `ckernel`), which is where the actual work happens. But the coordinator
+   itself (file discovery, CSV-header write, final row count) no longer needs
+   Python: the first `%SYS.Python` call in a process pays a one-time interpreter
+   init (~0.04 s) plus module-import cost, and keeping that out of the coordinator
+   trims ~0.12 s of fixed per-run overhead. Two pieces made it possible: file
+   discovery via `$ZSEARCH` + size-sort (~0.01 s, faster than the Python `glob`)
+   and a header write via low-level `OPEN`/`WRITE`, plus workers accumulating their
+   row counts in a shared global (`^Gaia.RowCount`) so the total needs no CSV
+   re-read. (The pure-Python fallback coordinator, used only when the C kernel
+   isn't built, still imports Python to merge the per-file parts.)
 5. **Longest-processing-time-first scheduling.** Files vary 11–28 MB; queueing the biggest
    first stops a large file from becoming an end-of-run straggler.
 
