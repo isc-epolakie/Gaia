@@ -7,15 +7,21 @@ Run()
  Set inDir = base_"/data/in"
  Set outPath = base_"/data/out/results.csv"
 
+ #; Ensure the (gitignored) output directory exists on a fresh clone.
+ Do ##class(%File).CreateDirectoryChain(##class(%File).GetDirectory(outPath))
+
  #; Start time
  Set startTime = $ZHOROLOG
 
- #; Fan the 20 files across %SYSTEM.WorkMgr worker jobs (each its own process +
- #; embedded Python, so flux-array parsing scales across cores with no GIL
- #; contention), then merge the per-file results into data/out/results.csv with
- #; the required header. Each worker keeps valid (finite, >0) BP/RP flux, computes
- #; per-band ((max-min)/min)*100, takes the larger of the two, emits rows > 100%.
- Set qualified = ##class(Gaia.Analyze).Run(inDir, outPath)
+ #; One embedded-Python call runs the whole job in C: the ckernel kernel globs
+ #; the input dir, sorts files biggest-first, and scans them across an OpenMP
+ #; team with the GIL released -- each thread libdeflate-decompresses one file
+ #; and appends its qualifying (>100%) rows to results.csv under an flock. The
+ #; ~1.5 GB of decompressed text never becomes Python objects. bp_flux is
+ #; "[...]"-array group 8, rp_flux group 13; nthreads=0 lets the kernel pick
+ #; ~0.75x the online CPUs.
+ Set ck = ##class(%SYS.Python).Import("ckernel")
+ Set qualified = ck."analyze_dir"(inDir, outPath, 8, 13, 100, 0)
 
  #; End time
  Set endTime = $ZHOROLOG
