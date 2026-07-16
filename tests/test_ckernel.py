@@ -47,3 +47,32 @@ def test_analyze_dir_matches_oracle_and_count(tmp_path):
     csv_ids = {ln.split(",", 1)[0] for ln in body}
     ref = _oracle()
     assert csv_ids == set(ref)
+
+    # parse CSV and verify numeric values match the oracle
+    for ln in body:
+        fields = ln.split(",")
+        source_id = fields[0]
+        # parse: "" -> None, else float
+        def parse_field(f):
+            return None if f == "" else float(f)
+        bp_min = parse_field(fields[1])
+        bp_max = parse_field(fields[2])
+        rp_min = parse_field(fields[3])
+        rp_max = parse_field(fields[4])
+        pct = float(fields[5])
+
+        oracle_row = ref[source_id]  # (id, bp_min, bp_max, rp_min, rp_max, pct)
+
+        # compare: None must match None; floats compared with relative tolerance
+        def floats_close(a, b):
+            if a is None and b is None:
+                return True
+            if a is None or b is None:
+                return False
+            return abs(a - b) < 1e-9 * max(1, abs(a))
+
+        assert floats_close(bp_min, oracle_row[1]), f"{source_id}: bp_min mismatch"
+        assert floats_close(bp_max, oracle_row[2]), f"{source_id}: bp_max mismatch"
+        assert floats_close(rp_min, oracle_row[3]), f"{source_id}: rp_min mismatch"
+        assert floats_close(rp_max, oracle_row[4]), f"{source_id}: rp_max mismatch"
+        assert floats_close(pct, oracle_row[5]), f"{source_id}: pct mismatch"

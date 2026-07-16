@@ -103,6 +103,9 @@ cdef char* _slurp_c(const char* cpath, size_t* outlen) nogil:
         fclose(fp); return NULL
     fread(cbuf, 1, csz, fp)
     fclose(fp)
+    # guard degenerate short files: valid gzip is at least 18 bytes (header + trailer)
+    if csz < 18:
+        free(cbuf); return NULL
     # size the output buffer from the gzip ISIZE trailer (last 4 bytes, LE) =
     # exact decompressed length mod 2^32. +64KB slack; grow-loop guards anyway.
     cdef unsigned char* u = <unsigned char*>cbuf
@@ -145,6 +148,8 @@ cdef long _scan_one(const char* cpath, int bg, int rg, double threshold,
     cdef char* ln
     cdef size_t llen
     cdef char c, saved
+    cdef size_t off = 0
+    cdef ssize_t k
     while i < n:
         le = i
         while le < n and out[le] != NL:
@@ -209,7 +214,7 @@ cdef long _scan_one(const char* cpath, int bg, int rg, double threshold,
                     wrote = snprintf(tmp, 512, "%s,,,%.17g,%.17g,%.17g\n",
                                      ln + sid_s, rmn, rmx, pct)
                 ln[sid_e] = saved
-                if wrote > 0:
+                if wrote > 0 and wrote < 512:
                     while obn + wrote > obcap:
                         obcap = obcap * 2
                         ob = <char*>realloc(ob, obcap)
@@ -218,9 +223,19 @@ cdef long _scan_one(const char* cpath, int bg, int rg, double threshold,
                     rows += 1
         i = le + 1
     free(out)
+    # One append of this file's whole buffer. Serialization against other
+    # threads' appends comes from the kernel's regular-file write path + O_APPEND
+    # (each write() lands atomically at EOF); flock on this shared fd does NOT
+    # serialize threads in one process, so we must not rely on it. Loop to handle
+    # short writes so no rows are silently dropped.
+    off = 0
     if obn > 0:
         flock(fd, LOCK_EX)
-        write(fd, ob, obn)
+        while off < obn:
+            k = write(fd, ob + off, obn - off)
+            if k <= 0:
+                break
+            off += k
         flock(fd, LOCK_UN)
     free(ob)
     return rows
