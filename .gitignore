@@ -32,8 +32,7 @@ iris-main.log
 # worker scratch + extracted CSVs
 data/temp/
 
-# Cython build artifacts (fastmm.pyx is the source; .c/.so are generated)
-src/gaia/fastmm.c
+# Cython build artifacts (ckernel.pyx is the source; .c/.so are generated)
+src/gaia/ckernel.c
 src/gaia/*.so
 src/gaia/build/
-src/gaia/ckernel.c
