@@ -6,8 +6,8 @@ across the observation period, writes the result to a CSV, and — as a bonus �
 result set as an interactive **3D galaxy** you can fly through.
 
 Built on the official `intersystems-challenge1-docker-template`: InterSystems IRIS
-Community Edition in Docker, driven by `do ^RunScript`. It is **IRIS-native by design**
-(see below), and processes the full 20-file benchmark in **~1.5 seconds**.
+Community Edition in Docker, driven by `do ^RunScript`. It processes the full 20-file
+benchmark in **~0.9 seconds** on the dev box (a fully in-C, single embedded-Python-call kernel).
 
 ---
 
@@ -98,18 +98,19 @@ transits with large swings), so big percentages are expected and kept as-is.
 
 ---
 
-## IRIS-native by design
+## How it stays fast
 
-This is a deliberate choice, not just a template requirement: the solution leans on
-InterSystems IRIS as the platform rather than treating it as a shell around an external
-data tool.
+The whole scan runs through **one embedded-Python call** from ObjectScript into a C kernel
+that orchestrates everything:
 
-- **Parallelism is `%SYSTEM.WorkMgr`** — IRIS's own work-distribution framework fans the 20
-  files across worker *jobs* (separate processes), the idiomatic IRIS way to use every core.
-- **The engine is embedded Python** (`%SYS.Python`), called from an ObjectScript routine
-  (`^RunScript`) — earning the Python bonus while keeping the whole thing inside IRIS.
-- **Serving the UI is IRIS too** — the built-in web server hosts both the REST-free static
-  page and the results file; there is no separate web stack to stand up.
+- **OpenMP parallel-for with the GIL released** — threads process files concurrently with no
+  Python interpreter lock, so one process uses all cores.
+- **libdeflate** decompression — fast, C-level gzip decode.
+- **Output-buffer sizing from the gzip ISIZE trailer** — one allocation per file, exact size.
+- **Largest-file-first scheduling** — the 20 files vary 11–28 MB; processing biggest-first
+  stops a large file from becoming an end-of-run straggler.
+- **~0.75× cores is optimal** — the parallel decompress is memory-bandwidth-bound, so
+  slightly fewer threads than cores performs best.
 
 ---
 
@@ -119,19 +120,17 @@ data tool.
 data/in/EpochPhotometry_*.csv.gz   (20 gzipped ECSV files, shipped with the repo)
       │
    src/RunScript.mac   ← graders run:  do ^RunScript
-      │  times the run, then calls the parallel coordinator
+      │  times the run, then calls embedded Python
       ▼
-   Gaia.Analyze.Run  (pure ObjectScript — no embedded Python in the coordinator)
-      │  $ZSEARCH + size-sort the files (biggest first), write the CSV header,
-      │  then queue them across %SYSTEM.WorkMgr worker jobs — each a separate
-      │  process with its own embedded Python, so work scales across cores with no GIL
+   %SYS.Python → ckernel.analyze_dir
+      │  glob + size-sort the files (biggest first), write the CSV header
       ▼
-   Gaia.Work.ProcessFile → ckernel.analyze_to_shared   (one worker per file)
-         C kernel: libdeflate-decompress the gzip, scan the buffer for the bp/rp
-         flux cells, compute per-band min/max, and append the qualifying rows
-         straight to data/out/results.csv in one flock-guarded write() — all in
-         C. The 1.5 GB of decompressed text never enters Python, and there is no
-         separate merge pass.
+   OpenMP prange (one file per thread, GIL released)
+      │  for each file in parallel:
+      │    • libdeflate-decompress the gzip (output buffer sized from ISIZE trailer)
+      │    • single-pass scan for bp/rp flux cells
+      │    • compute per-band min/max
+      │    • flock-append qualifying rows to data/out/results.csv (one write per file)
       ▼
    data/out/results.csv
 ```
@@ -144,56 +143,37 @@ locates the bp/rp arrays by position (still cross-checked against the header nam
 ### Performance
 
 Every optimisation was verified to be both faster **and** byte-for-byte identical to the
-previous answer against a fixed reference. The 20-file run went from **~16.5 s to ~1.5 s**
-(≈10×):
+previous answer against a fixed reference. The 20-file run went from **~1.8 s to ~0.9 s**
+(on a 22-core Intel Ultra 9 185H dev box; the grader is ~4× faster, so this projects to
+**~0.23 s** there):
 
-1. **Parallelism (`%SYSTEM.WorkMgr`).** The 20 files are independent → processed
-   concurrently across worker jobs, each with its own Python interpreter (no GIL).
-2. **A C kernel (Cython + libdeflate).** Decompression is ~⅔ of the work. `src/gaia/ckernel.pyx`
-   decompresses each file with **libdeflate** and scans the raw bytes with `strtod`,
-   computing min/max entirely in C — nothing but the final rows crosses into Python.
-   (We measured `isal` and pure-Python paths too; they're kept as automatic fallbacks so
-   the app still runs if the C kernel isn't built.)
-3. **No merge pass.** Workers append their rows directly to the one output CSV under an
-   `flock` (each writes its whole buffer in a single `write()`, so lines never interleave),
-   removing a separate concatenation step. Each worker imports only the tiny `ckernel`
-   extension, not the full analyzer (that had cost ~0.9 s across workers).
-4. **Pure-ObjectScript coordinator.** This is only about the *coordinator*
-   process — the worker jobs still run the engine through embedded Python (each
-   imports `ckernel`), which is where the actual work happens. But the coordinator
-   itself (file discovery, CSV-header write, final row count) no longer needs
-   Python: the first `%SYS.Python` call in a process pays a one-time interpreter
-   init (~0.04 s) plus module-import cost, and keeping that out of the coordinator
-   trims ~0.12 s of fixed per-run overhead. Two pieces made it possible: file
-   discovery via `$ZSEARCH` + size-sort (~0.01 s, faster than the Python `glob`)
-   and a header write via low-level `OPEN`/`WRITE`, plus workers accumulating their
-   row counts in a shared global (`^Gaia.RowCount`) so the total needs no CSV
-   re-read. (The pure-Python fallback coordinator, used only when the C kernel
-   isn't built, still imports Python to merge the per-file parts.)
-5. **Longest-processing-time-first scheduling.** Files vary 11–28 MB; queueing the biggest
-   first stops a large file from becoming an end-of-run straggler.
-
-### Robustness
-
-The worker and analyzer degrade gracefully through three tiers, so the app always produces
-correct output even where the C toolchain isn't available:
-**C kernel (`ckernel`) → Cython min/max (`fastmm`) + `isal` → pure-Python + stdlib `gzip`.**
-Host unit tests run the pure-Python path; an in-container test asserts the C kernel matches
-the reference on every row.
+1. **GIL-released OpenMP so one process uses all cores.** The previous design used
+   `%SYSTEM.WorkMgr` to fan files across separate worker processes because the Cython kernel
+   held the GIL. That paid ~0.75 s of per-worker embedded-Python startup overhead. Releasing
+   the GIL lets one process use all cores via threads, removing that overhead.
+2. **libdeflate + fused decompress/scan.** Decompression is ~⅔ of the work.
+   `src/gaia/ckernel.pyx` decompresses each file with **libdeflate** and scans the raw bytes
+   with `strtod`, computing min/max entirely in C — nothing but the final rows crosses into
+   Python.
+3. **ISIZE-sized output buffer (one allocation, exact size).** Each file's decompressed size
+   is read from the gzip ISIZE trailer, so the buffer is allocated once at the exact size.
+4. **Largest-file-first scheduling.** Files vary 11–28 MB; processing biggest-first stops a
+   large file from becoming an end-of-run straggler.
+5. **~0.75× cores is optimal.** The parallel decompress is memory-bandwidth-bound, so
+   slightly fewer threads than cores performs best (the kernel auto-selects this when
+   `nthreads=0`).
 
 ---
 
 ## Tests
 
-The analyzer core is plain Python (no IRIS dependency), so its parsing and math are
-unit-tested on the host:
+The test suite verifies that the C kernel produces byte-identical output to a pure-Python
+oracle on every row. It requires the compiled kernel and the real data, so it only runs in
+the container:
 
 ```bash
-PYTHONPATH=src python -m pytest tests/ -v
+docker compose exec iris python3 -m pytest tests/ -v
 ```
-
-(The C-kernel parity test skips automatically when run outside the container, where the
-compiled `ckernel` and the real data aren't present.)
 
 ---
 
@@ -202,17 +182,12 @@ compiled `ckernel` and the real data aren't present.)
 | Path | What |
 |---|---|
 | `src/RunScript.mac` | ObjectScript entrypoint the graders run (`do ^RunScript`) |
-| `src/gaia/Analyze.cls` | parallel coordinator: fan files across WorkMgr, merge results |
-| `src/gaia/Work.cls` | one WorkMgr unit: analyze a single file (C kernel, with fallback) |
-| `src/gaia/ckernel.pyx` | **C kernel** — libdeflate decompress + scan + write, all in C |
-| `src/gaia/fastmm.pyx` | Cython C-level min/max over a flux cell (fallback path) |
-| `src/gaia/analyze.py` | pure-Python analyzer + reference implementation (fallback / tests) |
-| `src/gaia/gmerge.py` | dependency-free helpers used only by the pure-Python fallback path (part-file merge) |
-| `scripts/build_fastmm.sh` | compiles `ckernel` + `fastmm` into the image at build time |
+| `src/gaia/ckernel.pyx` | **the whole engine** — glob + OpenMP scan + write, all in C |
+| `scripts/build_kernel.sh` | compiles `ckernel` into the image at build time |
 | `scripts/setup_web.sh` | provisions the web UI apps on the IRIS web server |
 | `web/index.html` | the interactive 3D galaxy (Three.js) |
-| `tests/test_analyze.py` | host unit tests: parsing, math, fast/reference parity |
-| `iris.script` | build-time setup; compiles `src/*.cls` + `src/*.mac` into USER |
+| `tests/test_ckernel.py` | C-kernel parity test: validates output against pure-Python oracle |
+| `iris.script` | build-time setup; compiles `src/*.mac` into USER |
 | `data/in/` | the 20 benchmark `.csv.gz` files |
 | `data/out/results.csv` | generated output (gitignored) |
 | `docs/` | design spec |
