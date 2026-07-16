@@ -1,43 +1,63 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
 """Full C kernel for the DR3 variability scan.
 
-Everything heavy happens in C: read the gzip file, decompress it with libdeflate
-in one shot, then scan the decompressed buffer for the bp/rp flux array cells,
-compute per-band min/max, and emit ONLY the qualifying rows. The 1.5 GB of
-decompressed text never becomes Python objects.
+One Python call runs the ENTIRE job in C with the GIL released: glob the input
+directory, sort files biggest-first, then an OpenMP parallel-for where each
+thread fused-decompresses (libdeflate) and scans one file, appending its
+qualifying rows to the shared output CSV under an flock. The ~1.5 GB of
+decompressed text never becomes Python objects, and there is no per-file Python
+round-trip and no separate process per file.
 
-Two entry points share one scanner:
-  * analyze(path, bg, rg, thr)            -> Python list of tuples  (parity test)
-  * analyze_to_file(path, bg, rg, thr, out) -> writes rows to `out` (production),
-                                               returns the row count
-
-libdeflate is declared inline (prototypes only) and linked against the system
-libdeflate.so.0; no dev headers required. analyze.py falls back to the pure
-Python / Cython-minmax path if this module isn't built.
+Entry points:
+  * analyze_dir(indir, outpath, bg, rg, thr, nthreads) -> total qualifying rows
+        production path. nthreads<=0 auto-selects ~0.75x the online CPUs.
+  * analyze(path, bg, rg, thr) -> Python list of tuples   (parity test oracle)
 """
 from libc.stdlib cimport malloc, realloc, free, strtod
-from libc.string cimport memcpy
-from libc.stdio cimport (FILE, fopen, fclose, fread, fseek, ftell,
-                         SEEK_END, SEEK_SET)
+from libc.string cimport memcpy, strlen
 
-cdef extern from "stdio.h":
-    int fprintf(FILE *, const char *, ...)
+cdef extern from "stdio.h" nogil:
     int snprintf(char *, size_t, const char *, ...)
+    ctypedef struct FILE
+    FILE *fopen(const char *, const char *)
+    int fclose(FILE *)
+    size_t fread(void *, size_t, size_t, FILE *)
+    int fseek(FILE *, long, int)
+    long ftell(FILE *)
+    int SEEK_END
+    int SEEK_SET
 
-cdef extern from "fcntl.h":
+cdef extern from "fcntl.h" nogil:
     int open(const char *, int, ...)
     int O_WRONLY
     int O_CREAT
     int O_APPEND
+    int O_TRUNC
 
-cdef extern from "unistd.h":
+cdef extern from "unistd.h" nogil:
     ssize_t write(int, const void *, size_t)
     int close(int)
 
-cdef extern from "sys/file.h":
+cdef extern from "sys/file.h" nogil:
     int flock(int, int)
     int LOCK_EX
     int LOCK_UN
+
+cdef extern from "sys/stat.h" nogil:
+    cdef struct stat_s "stat":
+        long st_size
+    int stat(const char *, stat_s *)
+
+cdef extern from "glob.h" nogil:
+    ctypedef struct glob_t:
+        size_t gl_pathc
+        char **gl_pathv
+    int glob(const char *, int, void *, glob_t *)
+    void globfree(glob_t *)
+
+cdef extern from "omp.h" nogil:
+    void omp_set_num_threads(int)
+    int omp_get_num_procs()
 
 cdef extern from *:
     """
@@ -50,49 +70,53 @@ cdef extern from *:
     """
     ctypedef struct libdeflate_decompressor:
         pass
-    libdeflate_decompressor *libdeflate_alloc_decompressor()
-    void libdeflate_free_decompressor(libdeflate_decompressor *d)
+    libdeflate_decompressor *libdeflate_alloc_decompressor() nogil
+    void libdeflate_free_decompressor(libdeflate_decompressor *d) nogil
     int libdeflate_gzip_decompress(libdeflate_decompressor *d, const void *in_,
-        size_t in_nbytes, void *out, size_t out_avail, size_t *actual_out)
+        size_t in_nbytes, void *out, size_t out_avail, size_t *actual_out) nogil
+
+from cython.parallel cimport prange
 
 cdef enum:
-    NL = 10        # \n
-    HASH = 35      # #
-    COMMA = 44     # ,
+    NL = 10
+    HASH = 35
+    COMMA = 44
     SPACE = 32
-    LBRK = 91      # [
-    RBRK = 93      # ]
-    CH_N = 78      # N
-    CH_n = 110     # n
+    LBRK = 91
+    RBRK = 93
+    CH_N = 78
+    CH_n = 110
 
 cdef double DMAX = 1.7976931348623157e308
 
 
-# --- read file + gzip-decompress into a malloc'd buffer; sets *outlen ---
-cdef char* _slurp(str path, size_t* outlen) except NULL:
-    cdef bytes pb = path.encode()
-    cdef const char* cpath = pb
+# --- read + gzip-decompress one file into a malloc'd buffer; sets *outlen ------
+cdef char* _slurp_c(const char* cpath, size_t* outlen) nogil:
     cdef FILE* fp = fopen(cpath, "rb")
     if fp == NULL:
-        raise IOError("cannot open " + path)
+        return NULL
     fseek(fp, 0, SEEK_END)
     cdef long csz = ftell(fp)
     fseek(fp, 0, SEEK_SET)
     cdef char* cbuf = <char*>malloc(csz)
     if cbuf == NULL:
-        fclose(fp); raise MemoryError()
+        fclose(fp); return NULL
     fread(cbuf, 1, csz, fp)
     fclose(fp)
-    cdef size_t cap = <size_t>csz * 12 + (1 << 20)
+    # size the output buffer from the gzip ISIZE trailer (last 4 bytes, LE) =
+    # exact decompressed length mod 2^32. +64KB slack; grow-loop guards anyway.
+    cdef unsigned char* u = <unsigned char*>cbuf
+    cdef size_t isize = (<size_t>u[csz-4]) | (<size_t>u[csz-3] << 8) | (<size_t>u[csz-2] << 16) | (<size_t>u[csz-1] << 24)
+    cdef size_t cap = isize + (1 << 16)
     cdef char* out = <char*>malloc(cap)
     cdef libdeflate_decompressor* d = libdeflate_alloc_decompressor()
     cdef size_t actual = 0
     cdef int rc = libdeflate_gzip_decompress(d, cbuf, csz, out, cap, &actual)
-    while rc != 0:                       # output buffer too small -> grow, retry
+    while rc != 0:
         cap = cap * 2
         out = <char*>realloc(out, cap)
         if out == NULL:
-            free(cbuf); libdeflate_free_decompressor(d); raise MemoryError()
+            free(cbuf); libdeflate_free_decompressor(d); return NULL
         rc = libdeflate_gzip_decompress(d, cbuf, csz, out, cap, &actual)
     libdeflate_free_decompressor(d)
     free(cbuf)
@@ -100,194 +124,19 @@ cdef char* _slurp(str path, size_t* outlen) except NULL:
     return out
 
 
-def analyze(str path, int bg, int rg, double threshold):
-    """Return a Python list of (source_id, bp_min, bp_max, rp_min, rp_max, pct)
-    for rows whose max(bp_pct, rp_pct) > threshold. Used by the parity test."""
+# --- scan one decompressed buffer; append qualifying rows to fd under flock ----
+cdef long _scan_one(const char* cpath, int bg, int rg, double threshold,
+                    int fd) nogil:
     cdef size_t n = 0
-    cdef char* out = _slurp(path, &n)
-    results = []
-    cdef size_t i = 0, le, q, sid_s, sid_e, p
-    cdef int grp, fld
-    cdef double bmn, bmx, rmn, rmx, v, bp_pct, rp_pct, pct
-    cdef bint bp_ok, rp_ok
-    cdef char* end
-    cdef char* ln
-    cdef size_t llen
-    cdef char c
-    while i < n:
-        le = i
-        while le < n and out[le] != NL:
-            le += 1
-        ln = out + i
-        llen = le - i
-        if llen == 0 or ln[0] == HASH:
-            i = le + 1; continue
-        sid_s = 0; sid_e = 0; q = 0; fld = 0
-        while q < llen:
-            if ln[q] == COMMA:
-                fld += 1
-                if fld == 1: sid_s = q + 1
-                elif fld == 2: sid_e = q; break
-            q += 1
-        bp_ok = False; rp_ok = False; bmn = bmx = rmn = rmx = 0
-        grp = -1; q = 0
-        while q < llen:
-            if ln[q] == LBRK:
-                grp += 1
-                if grp == bg or grp == rg:
-                    p = q + 1
-                    while p < llen and ln[p] != RBRK:
-                        c = ln[p]
-                        if c == COMMA or c == SPACE:
-                            p += 1; continue
-                        if c == CH_N or c == CH_n:
-                            while p < llen and ln[p] != COMMA and ln[p] != RBRK:
-                                p += 1
-                            continue
-                        v = strtod(ln + p, &end)
-                        if end == ln + p:
-                            p += 1; continue
-                        p = end - ln
-                        if v > 0.0 and v < DMAX:
-                            if grp == bg:
-                                if not bp_ok: bmn = v; bmx = v; bp_ok = True
-                                elif v < bmn: bmn = v
-                                elif v > bmx: bmx = v
-                            else:
-                                if not rp_ok: rmn = v; rmx = v; rp_ok = True
-                                elif v < rmn: rmn = v
-                                elif v > rmx: rmx = v
-                    q = p
-                    if grp >= bg and grp >= rg:
-                        break
-            q += 1
-        if bp_ok or rp_ok:
-            bp_pct = ((bmx - bmn) / bmn * 100.0) if bp_ok else -1.0
-            rp_pct = ((rmx - rmn) / rmn * 100.0) if rp_ok else -1.0
-            pct = bp_pct if bp_pct >= rp_pct else rp_pct
-            if pct > threshold:
-                results.append((
-                    ln[sid_s:sid_e].decode(),
-                    bmn if bp_ok else None, bmx if bp_ok else None,
-                    rmn if rp_ok else None, rmx if rp_ok else None, pct))
-        i = le + 1
-    free(out)
-    return results
-
-
-def analyze_to_file(str path, int bg, int rg, double threshold, str out_path):
-    """Scan `path` and write qualifying CSV rows (no header) to `out_path`,
-    entirely in C. Returns the number of rows written. This is the production
-    worker unit — no per-row Python objects are created.
-
-    Blank flux columns (a band with no valid values) are written empty. Numbers
-    use %.17g so the value round-trips exactly (matches Python's repr precision)."""
-    cdef size_t n = 0
-    cdef char* out = _slurp(path, &n)
-    cdef bytes ob = out_path.encode()
-    cdef FILE* of = fopen(<const char*>ob, "wb")
-    if of == NULL:
-        free(out); raise IOError("cannot write " + out_path)
-    cdef size_t i = 0, le, q, sid_s, sid_e, p
-    cdef int grp, fld
-    cdef long written = 0
-    cdef double bmn, bmx, rmn, rmx, v, bp_pct, rp_pct, pct
-    cdef bint bp_ok, rp_ok
-    cdef char* end
-    cdef char* ln
-    cdef size_t llen
-    cdef char c
-    cdef char saved
-    while i < n:
-        le = i
-        while le < n and out[le] != NL:
-            le += 1
-        ln = out + i
-        llen = le - i
-        if llen == 0 or ln[0] == HASH:
-            i = le + 1; continue
-        sid_s = 0; sid_e = 0; q = 0; fld = 0
-        while q < llen:
-            if ln[q] == COMMA:
-                fld += 1
-                if fld == 1: sid_s = q + 1
-                elif fld == 2: sid_e = q; break
-            q += 1
-        bp_ok = False; rp_ok = False; bmn = bmx = rmn = rmx = 0
-        grp = -1; q = 0
-        while q < llen:
-            if ln[q] == LBRK:
-                grp += 1
-                if grp == bg or grp == rg:
-                    p = q + 1
-                    while p < llen and ln[p] != RBRK:
-                        c = ln[p]
-                        if c == COMMA or c == SPACE:
-                            p += 1; continue
-                        if c == CH_N or c == CH_n:
-                            while p < llen and ln[p] != COMMA and ln[p] != RBRK:
-                                p += 1
-                            continue
-                        v = strtod(ln + p, &end)
-                        if end == ln + p:
-                            p += 1; continue
-                        p = end - ln
-                        if v > 0.0 and v < DMAX:
-                            if grp == bg:
-                                if not bp_ok: bmn = v; bmx = v; bp_ok = True
-                                elif v < bmn: bmn = v
-                                elif v > bmx: bmx = v
-                            else:
-                                if not rp_ok: rmn = v; rmx = v; rp_ok = True
-                                elif v < rmn: rmn = v
-                                elif v > rmx: rmx = v
-                    q = p
-                    if grp >= bg and grp >= rg:
-                        break
-            q += 1
-        if bp_ok or rp_ok:
-            bp_pct = ((bmx - bmn) / bmn * 100.0) if bp_ok else -1.0
-            rp_pct = ((rmx - rmn) / rmn * 100.0) if rp_ok else -1.0
-            pct = bp_pct if bp_pct >= rp_pct else rp_pct
-            if pct > threshold:
-                # NUL-terminate the source_id in-place to print it (we restore it)
-                saved = ln[sid_e]
-                ln[sid_e] = 0
-                if bp_ok and rp_ok:
-                    fprintf(of, "%s,%.17g,%.17g,%.17g,%.17g,%.17g\n",
-                            ln + sid_s, bmn, bmx, rmn, rmx, pct)
-                elif bp_ok:
-                    fprintf(of, "%s,%.17g,%.17g,,,%.17g\n",
-                            ln + sid_s, bmn, bmx, pct)
-                else:
-                    fprintf(of, "%s,,,%.17g,%.17g,%.17g\n",
-                            ln + sid_s, rmn, rmx, pct)
-                ln[sid_e] = saved
-                written += 1
-        i = le + 1
-    fclose(of)
-    free(out)
-    return written
-
-
-def analyze_to_shared(str path, int bg, int rg, double threshold, str shared_path):
-    """Like analyze_to_file, but instead of a private part file, build all
-    qualifying rows in one heap buffer and append them to `shared_path` in a
-    SINGLE flock-guarded write(). This removes the separate merge pass: every
-    worker appends straight to the final CSV. Safety: the whole buffer is written
-    under LOCK_EX in one write() call, so concurrent workers can't interleave
-    lines. Returns the number of rows written."""
-    cdef size_t n = 0
-    cdef char* out = _slurp(path, &n)
-
-    # growable output buffer
+    cdef char* out = _slurp_c(cpath, &n)
+    if out == NULL:
+        return 0
     cdef size_t obcap = 1 << 20
     cdef char* ob = <char*>malloc(obcap)
     cdef size_t obn = 0
     cdef char tmp[512]
     cdef int wrote
     cdef long rows = 0
-
     cdef size_t i = 0, le, q, sid_s, sid_e, p
     cdef int grp, fld
     cdef double bmn, bmx, rmn, rmx, v, bp_pct, rp_pct, pct
@@ -369,15 +218,155 @@ def analyze_to_shared(str path, int bg, int rg, double threshold, str shared_pat
                     rows += 1
         i = le + 1
     free(out)
-
-    # one locked append of the whole buffer
-    cdef bytes sb = shared_path.encode()
-    cdef int fd = open(<const char*>sb, O_WRONLY | O_CREAT | O_APPEND, 0o644)
-    if fd >= 0:
+    if obn > 0:
         flock(fd, LOCK_EX)
-        if obn > 0:
-            write(fd, ob, obn)
+        write(fd, ob, obn)
         flock(fd, LOCK_UN)
-        close(fd)
     free(ob)
     return rows
+
+
+def analyze_dir(str indir, str outpath, int bg, int rg, double threshold,
+                int nthreads):
+    """Run the whole job in C. Glob indir for EpochPhotometry_*.csv.gz, sort
+    biggest-first, scan them across an OpenMP team appending rows to outpath
+    (header written first). Returns the total qualifying-row count.
+    nthreads<=0 auto-selects max(1, 0.75 * online CPUs)."""
+    cdef bytes patb = (indir + "/EpochPhotometry_*.csv.gz").encode()
+    cdef bytes ob = outpath.encode()
+    cdef const char* cpat = patb
+    cdef const char* cout = ob
+    cdef glob_t g
+    cdef int rc
+    cdef size_t nf, k
+    cdef long total = 0
+    cdef int fd
+    cdef stat_s stbuf
+
+    with nogil:
+        rc = glob(cpat, 0, NULL, &g)
+    if rc != 0:
+        return 0
+    nf = g.gl_pathc
+    if nf == 0:
+        globfree(&g); return 0
+
+    # (re)create output with just the header, then reopen shared for append
+    fd = open(cout, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+    if fd < 0:
+        globfree(&g); raise IOError("cannot write " + outpath)
+    cdef const char* hdr = b"source_id,bp_min_flux,bp_max_flux,rp_min_flux,rp_max_flux,percentage_change\n"
+    write(fd, hdr, strlen(hdr))
+    close(fd)
+    fd = open(cout, O_WRONLY | O_APPEND, 0o644)
+
+    # order files biggest-first (longest-processing-time-first): the largest
+    # gzip member is unsplittable and bounds the wall clock, so start it at t=0.
+    cdef int* order = <int*>malloc(nf * sizeof(int))
+    cdef long* sizes = <long*>malloc(nf * sizeof(long))
+    for k in range(nf):
+        sizes[k] = stbuf.st_size if stat(g.gl_pathv[k], &stbuf) == 0 else 0
+        order[k] = <int>k
+    cdef int a, b, tmpi
+    for a in range(<int>nf):
+        for b in range(a + 1, <int>nf):
+            if sizes[order[b]] > sizes[order[a]]:
+                tmpi = order[a]; order[a] = order[b]; order[b] = tmpi
+
+    if nthreads <= 0:
+        nthreads = (omp_get_num_procs() * 3) / 4
+        if nthreads < 1:
+            nthreads = 1
+    omp_set_num_threads(nthreads)
+
+    cdef int idx
+    cdef long r
+    for idx in prange(<int>nf, nogil=True, schedule='dynamic'):
+        r = _scan_one(g.gl_pathv[order[idx]], bg, rg, threshold, fd)
+        total += r
+
+    free(order); free(sizes)
+    close(fd)
+    globfree(&g)
+    return total
+
+
+def analyze(str path, int bg, int rg, double threshold):
+    """Return a Python list of (source_id, bp_min, bp_max, rp_min, rp_max, pct)
+    for rows whose max(bp_pct, rp_pct) > threshold. Used by the parity test."""
+    cdef size_t n = 0
+    cdef bytes pb = path.encode()
+    cdef const char* cpath = pb
+    cdef char* out
+    with nogil:
+        out = _slurp_c(cpath, &n)
+    if out == NULL:
+        raise IOError("cannot open " + path)
+    results = []
+    cdef size_t i = 0, le, q, sid_s, sid_e, p
+    cdef int grp, fld
+    cdef double bmn, bmx, rmn, rmx, v, bp_pct, rp_pct, pct
+    cdef bint bp_ok, rp_ok
+    cdef char* end
+    cdef char* ln
+    cdef size_t llen
+    cdef char c
+    while i < n:
+        le = i
+        while le < n and out[le] != NL:
+            le += 1
+        ln = out + i
+        llen = le - i
+        if llen == 0 or ln[0] == HASH:
+            i = le + 1; continue
+        sid_s = 0; sid_e = 0; q = 0; fld = 0
+        while q < llen:
+            if ln[q] == COMMA:
+                fld += 1
+                if fld == 1: sid_s = q + 1
+                elif fld == 2: sid_e = q; break
+            q += 1
+        bp_ok = False; rp_ok = False; bmn = bmx = rmn = rmx = 0
+        grp = -1; q = 0
+        while q < llen:
+            if ln[q] == LBRK:
+                grp += 1
+                if grp == bg or grp == rg:
+                    p = q + 1
+                    while p < llen and ln[p] != RBRK:
+                        c = ln[p]
+                        if c == COMMA or c == SPACE:
+                            p += 1; continue
+                        if c == CH_N or c == CH_n:
+                            while p < llen and ln[p] != COMMA and ln[p] != RBRK:
+                                p += 1
+                            continue
+                        v = strtod(ln + p, &end)
+                        if end == ln + p:
+                            p += 1; continue
+                        p = end - ln
+                        if v > 0.0 and v < DMAX:
+                            if grp == bg:
+                                if not bp_ok: bmn = v; bmx = v; bp_ok = True
+                                elif v < bmn: bmn = v
+                                elif v > bmx: bmx = v
+                            else:
+                                if not rp_ok: rmn = v; rmx = v; rp_ok = True
+                                elif v < rmn: rmn = v
+                                elif v > rmx: rmx = v
+                    q = p
+                    if grp >= bg and grp >= rg:
+                        break
+            q += 1
+        if bp_ok or rp_ok:
+            bp_pct = ((bmx - bmn) / bmn * 100.0) if bp_ok else -1.0
+            rp_pct = ((rmx - rmn) / rmn * 100.0) if rp_ok else -1.0
+            pct = bp_pct if bp_pct >= rp_pct else rp_pct
+            if pct > threshold:
+                results.append((
+                    ln[sid_s:sid_e].decode(),
+                    bmn if bp_ok else None, bmx if bp_ok else None,
+                    rmn if rp_ok else None, rmx if rp_ok else None, pct))
+        i = le + 1
+    free(out)
+    return results
