@@ -1,6 +1,6 @@
-    ; Pre-compile our classes + routine into USER so graders can run
-    ; `do ^RunScript` straight away with no manual import step. Import classes
-    ; first (RunScript depends on Gaia.Analyze), then the .mac routine.
+    ; Pre-compile the RunScript routine into USER so graders can run
+    ; `do ^RunScript` straight away with no manual import step. The ImportDir
+    ; commands check for *.cls and *.mac; only the .mac routine exists now.
     do $System.OBJ.ImportDir("/home/irisowner/dev/src","*.cls","ck",,1)
     do $System.OBJ.ImportDir("/home/irisowner/dev/src","*.mac","ck",,1)
 
