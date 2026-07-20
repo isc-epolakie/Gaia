@@ -15,7 +15,7 @@ Entry points:
   * analyze(path, bg, rg, thr) -> Python list of tuples   (parity test oracle)
 """
 from libc.stdlib cimport malloc, realloc, free, strtod
-from libc.string cimport memcpy, strlen
+from libc.string cimport memcpy, strlen, memchr
 
 cdef extern from "stdio.h" nogil:
     int snprintf(char *, size_t, const char *, ...)
@@ -207,10 +207,13 @@ cdef long _scan_one(const char* cpath, int bg, int rg, double threshold,
     cdef char c, saved
     cdef size_t off = 0
     cdef ssize_t k
+    cdef void* _nlp
+    cdef void* _bp
+    cdef size_t _bpos
     while i < n:
-        le = i
-        while le < n and out[le] != NL:
-            le += 1
+        # find end of line with memchr (SIMD) instead of a byte-at-a-time scan
+        _nlp = memchr(out + i, NL, n - i)
+        le = (<char*>_nlp - out) if _nlp != NULL else n
         ln = out + i
         llen = le - i
         if llen == 0 or ln[0] == HASH:
@@ -223,37 +226,45 @@ cdef long _scan_one(const char* cpath, int bg, int rg, double threshold,
                 elif fld == 2: sid_e = q; break
             q += 1
         bp_ok = False; rp_ok = False; bmn = bmx = rmn = rmx = 0
+        # Walk bracket groups by jumping '[' to '[' with memchr. Only groups bg and
+        # rg are parsed; the ~43 other groups' contents are skipped entirely rather
+        # than scanned char-by-char. Brackets never nest (flat CSV), so a memchr for
+        # the next '[' from the current position always lands on the next group.
         grp = -1; q = 0
         while q < llen:
-            if ln[q] == LBRK:
-                grp += 1
-                if grp == bg or grp == rg:
-                    p = q + 1
-                    while p < llen and ln[p] != RBRK:
-                        c = ln[p]
-                        if c == COMMA or c == SPACE:
-                            p += 1; continue
-                        if c == CH_N or c == CH_n:
-                            while p < llen and ln[p] != COMMA and ln[p] != RBRK:
-                                p += 1
-                            continue
-                        v = _fast_atof(ln + p, &end)
-                        if end == ln + p:
-                            p += 1; continue
-                        p = end - ln
-                        if v > 0.0 and v < DMAX:
-                            if grp == bg:
-                                if not bp_ok: bmn = v; bmx = v; bp_ok = True
-                                elif v < bmn: bmn = v
-                                elif v > bmx: bmx = v
-                            else:
-                                if not rp_ok: rmn = v; rmx = v; rp_ok = True
-                                elif v < rmn: rmn = v
-                                elif v > rmx: rmx = v
-                    q = p
-                    if grp >= bg and grp >= rg:
-                        break
-            q += 1
+            _bp = memchr(ln + q, LBRK, llen - q)
+            if _bp == NULL:
+                break
+            _bpos = <char*>_bp - ln
+            grp += 1
+            if grp == bg or grp == rg:
+                p = _bpos + 1
+                while p < llen and ln[p] != RBRK:
+                    c = ln[p]
+                    if c == COMMA or c == SPACE:
+                        p += 1; continue
+                    if c == CH_N or c == CH_n:
+                        while p < llen and ln[p] != COMMA and ln[p] != RBRK:
+                            p += 1
+                        continue
+                    v = _fast_atof(ln + p, &end)
+                    if end == ln + p:
+                        p += 1; continue
+                    p = end - ln
+                    if v > 0.0 and v < DMAX:
+                        if grp == bg:
+                            if not bp_ok: bmn = v; bmx = v; bp_ok = True
+                            elif v < bmn: bmn = v
+                            elif v > bmx: bmx = v
+                        else:
+                            if not rp_ok: rmn = v; rmx = v; rp_ok = True
+                            elif v < rmn: rmn = v
+                            elif v > rmx: rmx = v
+                q = p
+                if grp >= bg and grp >= rg:
+                    break
+            else:
+                q = _bpos + 1
         if bp_ok or rp_ok:
             bp_pct = ((bmx - bmn) / bmn * 100.0) if bp_ok else -1.0
             rp_pct = ((rmx - rmn) / rmn * 100.0) if rp_ok else -1.0
