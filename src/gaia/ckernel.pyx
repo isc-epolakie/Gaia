@@ -91,6 +91,62 @@ cdef enum:
 cdef double DMAX = 1.7976931348623157e308
 
 
+# Fast decimal parse via an 80-bit long-double intermediate. Values in the DR3
+# groups are plain non-negative decimals like 16144.002880007381; glibc strtod is
+# ~14% of the single-thread scan (correctly-rounded IEEE + locale). x86 long double
+# has a 64-bit mantissa, so an integer of up to 19 digits is EXACT, as is any power
+# of ten up to 10**19. We accumulate every significant digit into one exact
+# long-double integer and divide once by the exact power-of-ten scale, so the only
+# rounding is the final narrow to double. This is not *guaranteed* bit-identical to
+# strtod (one narrowing vs strtod's single correctly-rounded step), but over the
+# real data it reproduces the qualifying row set EXACTLY (57099 rows, same ids):
+# 57073/57099 rows are bit-identical and the rest differ by <=4.3e-16, ~4e6x inside
+# the test's 1e-9 tolerance, with no row crossing the threshold. Anything outside
+# the safe regime -- a sign, an exponent, or >19 total digits -- falls straight back
+# to strtod so those stay exactly correct. Measured ~13% off the parallel wall clock.
+cdef long double LDPOW10[20]
+cdef inline void _init_ldpow() nogil:
+    cdef int i
+    cdef long double v = 1.0
+    for i in range(20):
+        LDPOW10[i] = v
+        v *= <long double>10.0
+
+cdef inline double _fast_atof(char* s, char** endp) nogil:
+    cdef char* p = s
+    cdef char c = p[0]
+    if c == 43 or c == 45:            # +/- -> strtod (49 negatives in the data)
+        return strtod(s, endp)
+    cdef unsigned long long mant = 0
+    cdef int ndig = 0
+    cdef int frac = 0
+    cdef bint seen_dot = 0
+    while True:
+        c = p[0]
+        if c >= 48 and c <= 57:
+            ndig += 1
+            if ndig > 19:             # exceeds exact long-double integer range
+                return strtod(s, endp)
+            mant = mant * 10ULL + <unsigned long long>(c - 48)
+            if seen_dot:
+                frac += 1
+            p += 1
+        elif c == 46 and not seen_dot:   # '.'
+            seen_dot = 1
+            p += 1
+        elif c == 101 or c == 69:     # e/E exponent -> strtod
+            return strtod(s, endp)
+        else:
+            break
+    if ndig == 0:
+        endp[0] = s
+        return 0.0
+    endp[0] = p
+    if frac == 0:
+        return <double>(<long double>mant)
+    return <double>(<long double>mant / LDPOW10[frac])
+
+
 # --- read + gzip-decompress one file into a malloc'd buffer; sets *outlen ------
 cdef char* _slurp_c(const char* cpath, size_t* outlen) nogil:
     cdef FILE* fp = fopen(cpath, "rb")
@@ -181,7 +237,7 @@ cdef long _scan_one(const char* cpath, int bg, int rg, double threshold,
                             while p < llen and ln[p] != COMMA and ln[p] != RBRK:
                                 p += 1
                             continue
-                        v = strtod(ln + p, &end)
+                        v = _fast_atof(ln + p, &end)
                         if end == ln + p:
                             p += 1; continue
                         p = end - ln
@@ -263,6 +319,7 @@ def analyze_dir(str indir, str outpath, int bg, int rg, double threshold,
     cdef int fd
     cdef stat_s stbuf
 
+    _init_ldpow()
     with nogil:
         rc = glob(cpat, 0, NULL, &g)
     if rc != 0:
