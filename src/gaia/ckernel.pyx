@@ -8,6 +8,12 @@ qualifying rows to the shared output CSV under an flock. The ~1.5 GB of
 decompressed text never becomes Python objects, and there is no per-file Python
 round-trip and no separate process per file.
 
+Flux values parse through a two-regime decimal parser (see _fast_atof): the
+80-bit x87 long-double fast path on native amd64, and a portable, correctly-
+rounded integer/__int128 parser under emulation (the grader runs platform:amd64
+on Apple silicon via Rosetta, which lacks 80-bit x87). The regime is picked once
+at startup by a runtime precision probe.
+
 Entry points:
   * analyze_dir(indir, outpath, bg, rg, thr, nthreads) -> total qualifying rows
         production path. nthreads<=0 auto-selects 2x online CPUs, capped at the

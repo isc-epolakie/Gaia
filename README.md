@@ -7,8 +7,10 @@ result set as an interactive **3D galaxy** you can fly through.
 
 Built on the official `intersystems-challenge1-docker-template`: InterSystems IRIS
 Community Edition in Docker, driven by `do ^RunScript`. It processes the full 20-file
-benchmark in **~0.92 seconds** on the dev box (a fully in-C, single embedded-Python-call
-kernel) — and roughly **~0.23 seconds** on the faster grader hardware.
+benchmark in **~0.9 seconds** on a 22-core dev box (a fully in-C, single embedded-Python-call
+kernel). The grader runs `platform: amd64` on Apple-silicon hardware (x86 under Rosetta), so
+the kernel detects the emulated FPU and picks a parser that stays correct and fast there —
+see "How it stays fast".
 
 ---
 
@@ -110,8 +112,15 @@ that orchestrates everything:
 - **Output-buffer sizing from the gzip ISIZE trailer** — one allocation per file, exact size.
 - **Largest-file-first scheduling** — the 20 files vary 11–28 MB; processing biggest-first
   stops a large file from becoming an end-of-run straggler.
-- **~0.75× cores is optimal** — the parallel decompress is memory-bandwidth-bound, so
-  slightly fewer threads than cores performs best.
+- **Thread count auto-caps to the data.** With `nthreads=0` the kernel picks `2×` the online
+  CPUs (low core counts are decompression-stall-bound and like the oversubscription), then
+  clamps to `ceil(total_bytes / largest_file) = 14` — past that, a thread has no unsplittable
+  work left. The bound is machine-independent, so it holds on any grader.
+- **A parser that stays correct under emulation.** Flux values parse through an 80-bit x87
+  long-double fast path on native amd64, but the grader runs `platform: amd64` on Apple
+  silicon via Rosetta, which lacks 80-bit x87. A startup precision probe detects that and
+  switches to a portable, correctly-rounded integer parser — proven bit-identical to `strtod`
+  on all 5.28M values, and ~2× faster than `strtod` on the emulated path. (Details below.)
 
 ---
 
@@ -157,17 +166,22 @@ bytes, not by clock speed):
    `%SYSTEM.WorkMgr` to fan files across separate worker processes because the Cython kernel
    held the GIL. That paid ~0.75 s of per-worker embedded-Python startup overhead. Releasing
    the GIL lets one process use all cores via threads, removing that overhead.
-2. **libdeflate + fused decompress/scan.** Decompression is ~⅔ of the work.
-   `src/gaia/ckernel.pyx` decompresses each file with **libdeflate** and scans the raw bytes
-   with `strtod`, computing min/max entirely in C — nothing but the final rows crosses into
-   Python.
-3. **ISIZE-sized output buffer (one allocation, exact size).** Each file's decompressed size
+2. **libdeflate + fused decompress/scan.** Decompression is ~¾ of the work (measured
+   81% single-thread). `src/gaia/ckernel.pyx` decompresses each file with **libdeflate** and
+   scans the raw bytes in C — the line walk and the jump between bracket groups both use
+   `memchr` (SIMD), and only the two flux groups are parsed. Nothing but the final rows
+   crosses into Python.
+3. **A parser matched to the hardware — and to emulation.** On native amd64, flux values
+   parse via an 80-bit x87 long-double intermediate. The grader runs under Rosetta, which
+   lacks 80-bit x87 and would silently corrupt that path (~123 rows flip across the >100%
+   threshold). A startup probe detects the missing precision and switches to a portable
+   correctly-rounded integer/`__int128` parser — bit-identical to `strtod` on all 5.28M real
+   values and ~2× faster than `strtod`, so the emulated path is both correct and quick.
+4. **ISIZE-sized output buffer (one allocation, exact size).** Each file's decompressed size
    is read from the gzip ISIZE trailer, so the buffer is allocated once at the exact size.
-4. **Largest-file-first scheduling.** Files vary 11–28 MB; processing biggest-first stops a
-   large file from becoming an end-of-run straggler.
-5. **~0.75× cores is optimal.** The parallel decompress is memory-bandwidth-bound, so
-   slightly fewer threads than cores performs best (the kernel auto-selects this when
-   `nthreads=0`).
+5. **Largest-file-first scheduling + data-derived thread cap.** Files vary 11–28 MB;
+   processing biggest-first stops a large file from becoming an end-of-run straggler, and the
+   thread count auto-caps to `ceil(total / largest) = 14` (see "How it stays fast").
 
 ---
 
@@ -175,12 +189,15 @@ bytes, not by clock speed):
 
 The test suite verifies that the production path (`analyze_dir` — the parallel, write-to-CSV
 kernel) agrees with an independent single-file oracle (`analyze`, a separate serial scan in
-the same module that returns plain tuples): it checks the qualifying-row count (57,099), the
-exact IDs, and every numeric min/max/percentage value per row. It requires the compiled
-kernel and the real data, so it only runs in the container:
+the same module that parses with `strtod` and returns plain tuples): it checks the
+qualifying-row count (57,099), the exact IDs, and every numeric min/max/percentage value per
+row. It runs the check under **both** parser regimes (native long-double and the Rosetta
+integer parser), and asserts the Rosetta path is *bit-identical* to the `strtod` oracle. It
+requires the compiled kernel and the real data, so it only runs in the container:
 
 ```bash
-docker compose exec iris python3 -m pytest tests/ -v
+docker compose exec iris python3 tests/test_ckernel.py     # no dependencies (stock image)
+docker compose exec iris python3 -m pytest tests/ -v       # if pytest is installed
 ```
 
 ---
