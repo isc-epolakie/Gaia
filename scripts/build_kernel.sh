@@ -23,7 +23,7 @@ cp /home/irisowner/dev/src/gaia/ckernel.pyx "$work/ckernel.pyx"
 cd "$work"
 python3 -c "from Cython.Build import cythonize; cythonize('ckernel.pyx', language_level=3)"
 x86_64-linux-gnu-gcc -shared -fPIC -O3 -fopenmp -I"$inc" ckernel.c \
-  -L"$libdir" -ldeflate \
+  -L"$libdir" -ldeflate -lm \
   -o "$site/ckernel${tag}"
 
 echo "built ckernel -> $site/ckernel${tag}"
